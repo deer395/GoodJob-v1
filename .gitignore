@@ -1,0 +1,18 @@
+# Local application data and SQLite sidecar files
+manual_capture/*.db
+manual_capture/*.db-shm
+manual_capture/*.db-wal
+
+# Python caches and local environments
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+.pytest_tmp/
+.venv/
+venv/
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CampusAI · 手动收录岗位</title><link rel="stylesheet" href="{{ url_for('static', path='app.css') }}"></head>
+<body><header><div class="brand">CampusAI</div><nav><a class="active" href="/">手动收录岗位</a><a href="/jobs">岗位池</a></nav></header>
+<main><div class="heading"><div><p class="eyebrow">岗位工作区</p><h1>{{ '更新岗位记录' if editing else '手动收录岗位' }}</h1><p>把看到的机会快速放进你的岗位池。</p></div><a class="pool-link" href="/jobs">查看岗位池</a></div>
+{% if success %}<div class="alert success">已收录：<strong>{{ success.company }} · {{ success.title }}</strong>{% if deadline_state(success.deadline) == 'near' %}<span class="badge near">临近截止</span>{% elif deadline_state(success.deadline) == 'expired' %}<span class="badge expired">已逾期</span>{% endif %}<a href="/jobs">查看岗位池</a><a href="/">再录一条</a></div>{% endif %}
+{% if duplicate %}<div class="alert warning"><strong>该岗位已收录</strong><span>{{ duplicate.company }} · {{ duplicate.title }} · {{ duplicate.city }}</span><a href="/jobs#job-{{ duplicate.id }}">查看原记录</a><a href="/jobs/{{ duplicate.id }}/edit">更新原记录</a></div>{% endif %}
+<form method="post" action="/jobs" class="capture-card" novalidate>{% if editing %}<input type="hidden" name="job_id" value="{{ editing.id }}">{% endif %}
+<section><div class="section-title"><h2>核心信息</h2><span>带 * 为必填项</span></div><div class="grid three">
+<label>公司名 *<input name="company" value="{{ form.company|default('') }}" autocomplete="organization">{% if errors.company %}<small>{{ errors.company }}</small>{% endif %}</label>
+<label>岗位名 *<input name="title" value="{{ form.title|default('') }}">{% if errors.title %}<small>{{ errors.title }}</small>{% endif %}</label>
+<label>工作地点 *<input name="city" value="{{ form.city|default('') }}" placeholder="如：北京、全国、多地、远程">{% if errors.city %}<small>{{ errors.city }}</small>{% endif %}</label>
+</div></section>
+<section class="supplement"><div class="section-title"><h2>补充信息</h2><span>可稍后补充</span></div><div class="grid three">
+<label>投递链接<input name="application_url" type="url" value="{{ form.application_url|default('') }}" placeholder="https://..."></label>
+<label>薪资范围<input name="salary_range" value="{{ form.salary_range|default('') }}" placeholder="如：20-30K·14薪"></label>
+<label>部门/业务线<input name="department" value="{{ form.department|default('') }}" placeholder="如：云产品、增长业务"></label>
+<label>投递截止日期<input name="deadline" type="date" value="{{ form.deadline|default('') }}">{% if errors.deadline %}<small>{{ errors.deadline }}</small>{% endif %}</label>
+<label>来源<select name="source">{% for item in sources %}<option value="{{ item }}" {% if form.source|default('官网') == item %}selected{% endif %}>{{ item }}</option>{% endfor %}</select>{% if errors.source %}<small>{{ errors.source }}</small>{% endif %}</label>
+<label class="wide">备注<textarea name="note" rows="3" maxlength="500" placeholder="例如：内推码、岗位方向、需留意的信息">{{ form.note|default('') }}</textarea><span class="field-hint">最多 500 字</span>{% if errors.note %}<small>{{ errors.note }}</small>{% endif %}</label>
+</div></section><div class="actions"><button type="submit">{{ '保存更新' if editing else '保存并收录' }}</button>{% if editing %}<a href="/jobs">取消</a>{% endif %}</div></form>
+{% if editing %}<form class="danger-zone" method="post" action="/jobs/{{ editing.id }}/delete" onsubmit="return confirm('确定删除这条岗位记录吗？此操作无法撤销。')"><div><strong>删除岗位记录</strong><p>删除后无法恢复，请确认这不是需要保留的历史信息。</p></div><button type="submit" class="delete-button">删除记录</button></form>{% endif %}
+</main><script>document.addEventListener('keydown',function(event){if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){const form=document.querySelector('.capture-card');if(form){event.preventDefault();form.requestSubmit();}}});</script></body></html>
