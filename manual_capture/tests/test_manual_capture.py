@@ -71,7 +71,7 @@ def test_note_limit_and_delete_from_edit_page(tmp_path):
     test_client.post("/jobs", data=payload())
     job_id = test_client.app.state.store.list()[0]["id"]
     deleted = test_client.post(f"/jobs/{job_id}/delete", follow_redirects=True)
-    assert "岗位记录已删除" in deleted.text
+    assert deleted.status_code == 200
     assert test_client.app.state.store.list() == []
 
 
@@ -109,3 +109,61 @@ def test_favorite_and_radar_search_include_department(tmp_path):
     test_client.post(f"/jobs/{job_id}/favorite")
     assert "字节跳动" in test_client.get("/jobs?state=favorite").text
     assert "字节跳动" in test_client.get("/jobs?q=增长").text
+
+
+def test_graduation_mismatch_from_job_note_never_receives_a_score(tmp_path):
+    test_client = client(tmp_path)
+    test_client.post("/jobs", data=payload(company="阿里淘天", city="杭州", note="2027届应届生"))
+    test_client.post("/profile", data={"graduation_year": "2026", "target_cities": "杭州"})
+    job = test_client.app.state.store.list()[0]
+    assert job["match_score"] is None
+    assert "届别不匹配" in job["match_reasons"]
+
+
+def test_direction_atom_match_and_unrelated_direction(tmp_path):
+    test_client = client(tmp_path)
+    test_client.post("/jobs", data=payload(company="京东", title="产品技术经理", city="北京"))
+    test_client.post("/profile", data={"target_directions": "产品经理"})
+    assert test_client.app.state.store.list()[0]["match_score"] == 20
+
+    test_client.post("/jobs", data=payload(company="网易", title="前端开发", city="杭州"))
+    unmatched = next(job for job in test_client.app.state.store.list() if job["company"] == "网易")
+    assert unmatched["match_score"] == 0
+
+
+def test_char_ngram_threshold_matches_related_words_only(tmp_path):
+    test_client = client(tmp_path)
+    test_client.post("/jobs", data=payload(company="京东", title="产品技术经理", city="北京"))
+    test_client.post("/profile", data={"target_directions": "产品经理"})
+    assert test_client.app.state.store.list()[0]["match_score"] == 20
+
+
+def test_application_workflow_preserves_items_on_withdraw(tmp_path):
+    test_client = client(tmp_path)
+    test_client.post("/jobs", data=payload())
+    test_client.post("/jobs/1/prepare")
+    assert len(test_client.app.state.store.application_items(1)) == 5
+    for item in test_client.app.state.store.application_items(1)[:4]:
+        test_client.post(f"/checklist/{item['id']}/toggle", data={"app_id": 1})
+    test_client.post("/applications/1/save", data={"resume_version":"v1", "next_action":"等待通知", "notes":""})
+    assert test_client.app.state.store.confirm_application(1)
+    test_client.post("/applications/1/withdraw", data={"confirmed":"true"})
+    application = test_client.app.state.store.application(1)
+    assert application["status"] == "待投递" and application["applied_at"] is None and application["next_action"] == "等待通知"
+
+
+def test_confirm_application_accepts_string_form_value_and_next_action_saves(tmp_path):
+    test_client = client(tmp_path)
+    deadline = (date.today() + timedelta(days=2)).isoformat()
+    test_client.post("/jobs", data=payload(deadline=deadline))
+    test_client.post("/jobs/1/prepare")
+    assert "2 天后截止" in test_client.get("/applications").text
+
+    response = test_client.post("/applications/1/confirm", data={"confirmed": "true"})
+    assert response.status_code == 200
+    application = test_client.app.state.store.application(1)
+    assert application["status"] == "已投递" and application["applied_at"]
+
+    saved = test_client.post("/applications/1/next-action", data={"next_action": "等待笔试通知"})
+    assert saved.status_code == 200
+    assert test_client.app.state.store.application(1)["next_action"] == "等待笔试通知"

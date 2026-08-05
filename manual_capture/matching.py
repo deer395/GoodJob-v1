@@ -4,12 +4,40 @@ from __future__ import annotations
 import json
 import re
 
-DELIMITERS = re.compile(r"[,，、/;；]+")
+DELIMITERS = re.compile(r"[,，、/;；|&+\s]+")
 DEGREE_RANK = {"大专": 1, "本科": 2, "硕士": 3, "博士": 4}
 
 
 def parts(value: str | None) -> list[str]:
     return [item.strip().lower() for item in DELIMITERS.split(value or "") if item.strip()]
+
+
+def canonical_tags(value: str | None) -> str:
+    """Normalize tag input for storage without inventing or changing its meaning."""
+    return ",".join(dict.fromkeys(parts(value)))
+
+
+def char_ngrams(value: str, n: int = 2) -> set[str]:
+    compact = re.sub(r"\s+", "", value.lower())
+    if len(compact) < n:
+        return {compact} if compact else set()
+    return {compact[index:index + n] for index in range(len(compact) - n + 1)}
+
+
+def ngram_overlap(tag: str, text: str) -> float:
+    """Directional char 2-gram coverage: tag grams explained by the job text."""
+    tag_grams = char_ngrams(tag)
+    if not tag_grams:
+        return 0.0
+    return len(tag_grams & char_ngrams(text)) / len(tag_grams)
+
+
+def calc_tag_score(tag: str, job_text: str) -> tuple[int, float]:
+    ratio = ngram_overlap(tag, job_text)
+    if ratio >= .8: return 25, ratio
+    if ratio >= .6: return 20, ratio
+    if ratio >= .4: return 15, ratio
+    return 0, ratio
 
 
 def configured(profile: dict | None) -> bool:
@@ -33,10 +61,12 @@ def evaluate(job: dict, profile: dict | None) -> tuple[int | None, str | None]:
         reasons.append("工作地点需人工确认")
     elif any(item in city for item in parts(profile.get("target_cities"))):
         score += 30; reasons.append(f"城市匹配：{job.get('city')}（+30）")
-    for label, values, points in (("方向", parts(profile.get("target_directions")), 25), ("技能", parts(profile.get("skills")), 25)):
-        hit = next((item for item in values if item in text), None)
+    for label, values in (("方向", parts(profile.get("target_directions"))), ("技能", parts(profile.get("skills")))):
+        scored = [(tag, *calc_tag_score(tag, text)) for tag in values]
+        hit = next(((tag, points, ratio) for tag, points, ratio in scored if points), None)
         if hit:
-            score += points; reasons.append(f"{label}匹配：{hit}（+{points}）")
+            tag, points, ratio = hit
+            score += points; reasons.append(f"{label}匹配：{tag}（重叠率 {ratio:.0%} → +{points}）")
     requirement = next((degree for degree in DEGREE_RANK if degree in text), None)
     current = (profile.get("degree") or "").strip()
     if requirement:

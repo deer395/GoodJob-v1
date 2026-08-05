@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GoodJobAI · 投递工作台</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}">
+</head>
+<body>
+  <header>
+    <div class="brand">GoodJobAI</div>
+    <nav>
+      <a href="/">手动收录岗位</a>
+      <a href="/jobs">秋招雷达</a>
+      <a class="active" href="/applications">投递工作台</a>
+      <a href="/profile">求职画像</a>
+    </nav>
+  </header>
+  <main>
+    <div class="heading">
+      <div>
+        <p class="eyebrow">投递管理</p>
+        <h1>投递工作台</h1>
+        <p>把优先岗位加入待投递；完成官方渠道投递后，再标记为已投递。</p>
+      </div>
+      <button type="button" onclick="document.getElementById('manual').showModal()">手动记录已投递</button>
+    </div>
+
+    {% if message %}<div class="alert success">{{ message }}</div>{% endif %}
+
+    <div class="filter-tabs workspace-tabs">
+      <a class="filter-tab {% if tab != 'sent' %}selected{% endif %}" href="/applications">待投递（{{ pending|length }}）</a>
+      <a class="filter-tab {% if tab == 'sent' %}selected{% endif %}" href="/applications?tab=sent">已投递（{{ sent|length }}）</a>
+    </div>
+
+    <div class="job-list">
+      {% for app in (sent if tab == 'sent' else pending) %}
+      <article class="job {% if focus == app.id %}focused{% endif %}">
+        <div>
+          <h2>{{ app.company }} · {{ app.title }} · {{ app.city }}</h2>
+          {% if app.status == '待投递' %}
+          <p class="deadline {{ deadline_state(app.deadline) or '' }}">DDL：{{ deadline_countdown(app.deadline) }}{% if app.deadline %}（{{ app.deadline }}）{% endif %}</p>
+          <p>来源：{{ app.source }}</p>
+          {% else %}
+          <p>投递时间：{{ app.applied_at or '未记录' }}</p>
+          <p>来源：{{ app.source }}</p>
+          {% endif %}
+          {% if app.application_url %}<p><a href="{{ app.application_url }}" target="_blank" rel="noopener">打开投递链接 ↗</a></p>{% endif %}
+        </div>
+        <div class="job-actions">
+          {% if app.status == '待投递' %}
+          <form method="post" action="/applications/{{ app.id }}/confirm">
+            <input type="hidden" name="confirmed" value="true">
+            <button type="submit">投递完成</button>
+          </form>
+          {% else %}
+          <form method="post" action="/applications/{{ app.id }}/next-action" class="next-action-form">
+            <label>下一步行动
+              <input name="next_action" value="{{ app.next_action or '' }}" placeholder="如：等待笔试通知">
+            </label>
+            <button type="submit">保存</button>
+          </form>
+          <form method="post" action="/applications/{{ app.id }}/withdraw">
+            <input type="hidden" name="confirmed" value="true">
+            <button type="submit" class="secondary">撤回到待投递</button>
+          </form>
+          {% endif %}
+        </div>
+      </article>
+      {% else %}
+      <div class="empty">
+        {% if tab == 'sent' %}
+        还没有已投递记录。可使用右上角按钮手动补录。
+        {% else %}
+        还没有待投递岗位。请前往 <a href="/jobs">秋招雷达</a>，在岗位详情中点击“准备投递”。
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+  </main>
+
+  <dialog id="manual">
+    <form method="post" action="/applications/manual">
+      <button type="button" class="dialog-close" onclick="this.closest('dialog').close()">关闭</button>
+      <h2>手动记录已投递</h2>
+      <p>用于在 BOSS、官网或其他渠道已经完成投递的岗位。</p>
+      <label>公司名 *<input name="company" required></label>
+      <label>岗位名 *<input name="title" required></label>
+      <label>工作地点 *<input name="city" required></label>
+      <label>来源
+        <select name="source"><option>其他</option><option>官网</option><option>BOSS直聘</option><option>牛客</option><option>公众号</option></select>
+      </label>
+      <label>投递链接<input name="application_url" type="url"></label>
+      <button type="submit">保存为已投递</button>
+    </form>
+  </dialog>
+</body>
+</html>
