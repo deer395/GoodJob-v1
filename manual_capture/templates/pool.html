@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GoodJobAI · 秋招雷达</title><link rel="stylesheet" href="{{ url_for('static', path='app.css') }}"></head>
 <body>
-<header><div class="brand">GoodJobAI</div><nav><a href="/">手动收录岗位</a><a class="active" href="/jobs">秋招雷达</a><a href="/applications">投递工作台</a><a href="/profile">求职画像</a></nav></header>
+<header><div class="brand">GoodJobAI</div><nav><a href="/">手动收录岗位</a><a class="active" href="/jobs">秋招雷达</a><a href="/applications">投递工作台</a><a href="/progress">申请进度</a><a href="/profile">求职画像</a></nav></header>
 <main>
   <div class="heading"><div><p class="eyebrow">岗位工作区</p><h1>秋招雷达</h1><p>快速查看新增、临近截止和已收藏的岗位。</p></div><a class="pool-link" href="/">收录新岗位</a></div>
   {% if not profile_configured %}<div class="alert warning">配置求职画像后开启规则匹配<a href="/profile">配置求职画像</a></div>{% endif %}

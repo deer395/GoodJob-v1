@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>GoodJobAI · 手动收录岗位</title><link rel="stylesheet" href="{{ url_for('static', path='app.css') }}"></head>
-<body><header><div class="brand">GoodJobAI</div><nav><a class="active" href="/">手动收录岗位</a><a href="/jobs">岗位池</a></nav></header>
+<body><header><div class="brand">GoodJobAI</div><nav><a class="active" href="/">手动收录岗位</a><a href="/jobs">岗位池</a><a href="/applications">投递工作台</a><a href="/progress">申请进度</a><a href="/profile">求职画像</a></nav></header>
 <main><div class="heading"><div><p class="eyebrow">岗位工作区</p><h1>{{ '更新岗位记录' if editing else '手动收录岗位' }}</h1><p>把看到的机会快速放进你的岗位池。</p></div><a class="pool-link" href="/jobs">查看岗位池</a></div>
 {% if success %}<div class="alert success">已收录：<strong>{{ success.company }} · {{ success.title }}</strong>{% if deadline_state(success.deadline) == 'near' %}<span class="badge near">临近截止</span>{% elif deadline_state(success.deadline) == 'expired' %}<span class="badge expired">已逾期</span>{% endif %}<a href="/jobs">查看岗位池</a><a href="/">再录一条</a></div>{% endif %}
 {% if duplicate %}<div class="alert warning"><strong>该岗位已收录</strong><span>{{ duplicate.company }} · {{ duplicate.title }} · {{ duplicate.city }}</span><a href="/jobs#job-{{ duplicate.id }}">查看原记录</a><a href="/jobs/{{ duplicate.id }}/edit">更新原记录</a></div>{% endif %}

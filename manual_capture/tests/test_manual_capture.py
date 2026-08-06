@@ -1,5 +1,7 @@
 from datetime import date, timedelta
 
+import pytest
+
 from fastapi.testclient import TestClient
 
 from manual_capture.app import create_app
@@ -167,3 +169,84 @@ def test_confirm_application_accepts_string_form_value_and_next_action_saves(tmp
     saved = test_client.post("/applications/1/next-action", data={"next_action": "等待笔试通知"})
     assert saved.status_code == 200
     assert test_client.app.state.store.application(1)["next_action"] == "等待笔试通知"
+
+
+def test_progress_allows_skip_and_creates_events_and_funnel(tmp_path):
+    test_client = client(tmp_path)
+    test_client.post("/jobs", data=payload(company="字节跳动"))
+    test_client.post("/jobs", data=payload(company="腾讯", title="后端开发"))
+    test_client.post("/jobs/1/prepare")
+    test_client.post("/jobs/2/prepare")
+    assert test_client.app.state.store.confirm_application(1)
+    assert test_client.app.state.store.confirm_application(2)
+
+    store = test_client.app.state.store
+    store.advance_application(1, "面试", "一面", date.today().isoformat(), "一面通知")
+    store.advance_application(1, "Offer", "Offer", date.today().isoformat())
+    assert store.application_by_id(1)["status"] == "Offer"
+    assert {event["event_type"] for event in store.application_events(1)} == {"已投递", "一面", "Offer"}
+    assert store.funnel() == {"已投递": 2, "测评/笔试": 0, "面试": 1, "Offer": 1}
+    with pytest.raises(ValueError, match="无效的目标阶段|不能回退"):
+        store.advance_application(1, "待投递", "已投递", date.today().isoformat())
+
+
+def test_progress_same_stage_add_event_and_end_statuses(tmp_path):
+    test_client = client(tmp_path)
+    test_client.post("/jobs", data=payload())
+    test_client.post("/jobs/1/prepare")
+    store = test_client.app.state.store
+    assert store.confirm_application(1)
+    store.advance_application(1, "测评/笔试", "笔试通知", "2026-08-06")
+    store.advance_application(1, "测评/笔试", "其他测评", "2026-08-07")
+    store.add_application_event(1, "补充材料", "2026-08-08", "材料已提交")
+    assert store.application_by_id(1)["status"] == "测评/笔试"
+    assert len(store.application_events(1)) == 4
+    store.advance_application(1, "已结束", "主动放弃", "2026-08-09")
+    assert store.application_by_id(1)["status"] == "已结束"
+
+
+def test_historical_applied_event_is_backfilled_only_once(tmp_path):
+    db_path = tmp_path / "history.db"
+    app = create_app(db_path)
+    store = app.state.store
+    job_id = store.create({**payload(), "application_url": "", "salary_range": "", "department": "", "description_text": "", "deadline": "", "note": ""})
+    stamp = "2026-08-01T10:00:00"
+    with store.connection() as conn:
+        conn.execute("INSERT INTO applications(job_id,status,applied_at,created_at,updated_at) VALUES(?,?,?,?,?)", (job_id, "已投递", stamp, stamp, stamp))
+    restarted = create_app(db_path).state.store
+    assert len(restarted.application_events(1)) == 1
+    create_app(db_path)
+    assert len(restarted.application_events(1)) == 1
+
+
+def test_progress_page_excludes_pending_and_saves_plan_and_withdraws(tmp_path):
+    test_client = client(tmp_path)
+    test_client.post("/jobs", data=payload(company="待投递公司"))
+    test_client.post("/jobs/1/prepare")
+    assert "待投递公司" not in test_client.get("/progress").text
+    assert test_client.app.state.store.confirm_application(1)
+    response = test_client.post("/progress/1/next-action", data={"next_action": "准备笔试", "next_action_due_at": "2026-08-10T09:30"}, follow_redirects=True)
+    assert "下一步行动已保存" in response.text
+    assert test_client.app.state.store.application_by_id(1)["next_action_due_at"] == "2026-08-10T09:30"
+    withdrawn = test_client.post("/applications/1/withdraw", data={"confirmed": "true"}, follow_redirects=True)
+    assert "已撤回至待投递" in withdrawn.text
+    assert "待投递公司" not in test_client.get("/progress").text
+    assert test_client.app.state.store.application_events(1)
+
+
+def test_progress_calendar_projects_existing_events_deadlines_and_plan_time(tmp_path):
+    test_client = client(tmp_path)
+    today = date.today()
+    test_client.post("/jobs", data=payload(deadline=today.isoformat()))
+    test_client.post("/jobs/1/prepare")
+    store = test_client.app.state.store
+    assert store.confirm_application(1)
+    store.advance_application(1, "面试", "一面", today.isoformat())
+    store.save_application(1, "", "准备面试", "", f"{today.isoformat()}T09:00")
+
+    calendar_page = test_client.get(f"/progress?view=calendar&year={today.year}&month={today.month}")
+    assert calendar_page.status_code == 200
+    assert "日历视图" in calendar_page.text
+    assert "DDL · 字节跳动 · 产品经理" in calendar_page.text
+    assert "一面 · 字节跳动 · 产品经理" in calendar_page.text
+    assert "下一步 · 字节跳动 · 产品经理" in calendar_page.text

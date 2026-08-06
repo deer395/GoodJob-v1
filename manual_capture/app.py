@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import sqlite3
+import calendar as calendar_module
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterator
 
@@ -14,6 +15,22 @@ from .matching import canonical_tags, configured, evaluate
 
 BASE_DIR = Path(__file__).resolve().parent
 SOURCES = ("官网", "BOSS直聘", "牛客", "公众号", "其他")
+APPLICATION_STATUSES = ("待投递", "已投递", "测评/笔试", "面试", "Offer", "已结束")
+PROGRESS_STATUSES = APPLICATION_STATUSES[1:]
+STAGE_EVENT_TYPES = {
+    "已投递": ("已投递",),
+    "测评/笔试": ("测评通知", "笔试通知", "其他测评"),
+    "面试": ("一面", "二面", "三面", "HR面", "其他面试"),
+    "Offer": ("Offer",),
+    "已结束": ("拒信", "主动放弃", "Offer拒绝", "其他结束"),
+}
+EVENT_TYPES = tuple(dict.fromkeys(item for values in STAGE_EVENT_TYPES.values() for item in values)) + ("备注", "补充材料", "其他记录")
+ADVANCE_TARGETS = {
+    "已投递": ("测评/笔试", "面试", "Offer", "已结束"),
+    "测评/笔试": ("测评/笔试", "面试", "Offer", "已结束"),
+    "面试": ("面试", "Offer", "已结束"),
+    "Offer": ("Offer", "已结束"),
+}
 
 
 class JobStore:
@@ -62,8 +79,26 @@ class JobStore:
               id INTEGER PRIMARY KEY CHECK(id=1), graduation_year TEXT, degree TEXT, school TEXT,
               major TEXT, target_cities TEXT, target_directions TEXT, target_industries TEXT,
               skills TEXT, constraints TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
-            conn.execute("""CREATE TABLE IF NOT EXISTS applications (id INTEGER PRIMARY KEY, job_id INTEGER UNIQUE NOT NULL, status TEXT NOT NULL, applied_at TEXT, resume_version TEXT, next_action TEXT, notes TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS applications (id INTEGER PRIMARY KEY, job_id INTEGER UNIQUE NOT NULL, status TEXT NOT NULL, applied_at TEXT, resume_version TEXT, next_action TEXT, next_action_due_at TEXT, notes TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
             conn.execute("""CREATE TABLE IF NOT EXISTS checklist_items (id INTEGER PRIMARY KEY, application_id INTEGER NOT NULL, label TEXT NOT NULL, is_completed INTEGER NOT NULL DEFAULT 0, is_predefined INTEGER NOT NULL, sort_order INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(applications)").fetchall()}
+            if "next_action_due_at" not in columns:
+                conn.execute("ALTER TABLE applications ADD COLUMN next_action_due_at TEXT")
+            conn.execute("""CREATE TABLE IF NOT EXISTS application_events (
+                id INTEGER PRIMARY KEY, application_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL, event_date TEXT NOT NULL,
+                description TEXT, created_at TEXT NOT NULL,
+                FOREIGN KEY(application_id) REFERENCES applications(id)
+            )""")
+            self._backfill_applied_events(conn)
+
+    @staticmethod
+    def _backfill_applied_events(conn: sqlite3.Connection) -> None:
+        conn.execute("""INSERT INTO application_events(application_id,event_type,event_date,description,created_at)
+            SELECT a.id,'已投递',a.applied_at,'用户确认已在官方渠道提交申请',a.applied_at
+            FROM applications a WHERE a.applied_at IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM application_events e WHERE e.application_id=a.id AND e.event_type='已投递'
+            )""")
 
     @staticmethod
     def normalized(*values: str) -> tuple[str, ...]:
@@ -188,11 +223,122 @@ class JobStore:
     def list_applications(self, status: str):
         with self.connection() as conn: return conn.execute("SELECT a.*,j.company,j.title,j.city,j.deadline,j.source,j.application_url,j.is_favorite,j.match_score FROM applications a JOIN job_postings j ON j.id=a.job_id WHERE a.status=? ORDER BY a.updated_at DESC",(status,)).fetchall()
 
-    def save_application(self, app_id: int, resume_version: str, next_action: str, notes: str):
+    def save_application(self, app_id: int, resume_version: str, next_action: str, notes: str, next_action_due_at: str | None = None):
         stamp=datetime.now().isoformat(timespec="seconds")
         with self.connection() as conn:
-            conn.execute("UPDATE applications SET resume_version=?,next_action=?,notes=?,updated_at=? WHERE id=?",(resume_version.strip(),next_action.strip(),notes.strip(),stamp,app_id))
+            due = next_action_due_at.strip() if next_action_due_at is not None else None
+            if due is None:
+                conn.execute("UPDATE applications SET resume_version=?,next_action=?,notes=?,updated_at=? WHERE id=?",(resume_version.strip(),next_action.strip(),notes.strip(),stamp,app_id))
+            else:
+                conn.execute("UPDATE applications SET resume_version=?,next_action=?,next_action_due_at=?,notes=?,updated_at=? WHERE id=?",(resume_version.strip(),next_action.strip(),due,notes.strip(),stamp,app_id))
             conn.execute("UPDATE checklist_items SET is_completed=?,updated_at=? WHERE application_id=? AND is_predefined=1 AND sort_order=5",(int(bool(next_action.strip())),stamp,app_id))
+
+    def application_events(self, app_id: int):
+        with self.connection() as conn:
+            return conn.execute("SELECT * FROM application_events WHERE application_id=? ORDER BY event_date DESC,created_at DESC,id DESC", (app_id,)).fetchall()
+
+    def list_progress_applications(self, status: str = "all"):
+        clauses = ["a.status IN ('已投递','测评/笔试','面试','Offer','已结束')"]
+        params: list[str] = []
+        if status in PROGRESS_STATUSES:
+            clauses.append("a.status=?")
+            params.append(status)
+        with self.connection() as conn:
+            return conn.execute(f"""SELECT a.*,j.company,j.title,j.city,j.deadline,j.source,j.application_url,j.match_score,j.match_reasons,
+                COALESCE((SELECT MAX(event_date) FROM application_events e WHERE e.application_id=a.id),a.applied_at,a.updated_at) AS latest_event_date
+                FROM applications a JOIN job_postings j ON j.id=a.job_id
+                WHERE {' AND '.join(clauses)}
+                ORDER BY CASE WHEN a.status='已结束' THEN 1 ELSE 0 END, a.next_action_due_at IS NULL, a.next_action_due_at, latest_event_date DESC, a.id DESC""", params).fetchall()
+
+    def progress_counts(self) -> dict[str, int]:
+        with self.connection() as conn:
+            rows = conn.execute("SELECT status,COUNT(*) AS count FROM applications WHERE status IN ('已投递','测评/笔试','面试','Offer','已结束') GROUP BY status").fetchall()
+        counts = {status: 0 for status in PROGRESS_STATUSES}
+        counts.update({row["status"]: row["count"] for row in rows})
+        counts["all"] = sum(counts.values())
+        return counts
+
+    def funnel(self) -> dict[str, int]:
+        groups = {
+            "已投递": ("已投递",),
+            "测评/笔试": STAGE_EVENT_TYPES["测评/笔试"],
+            "面试": STAGE_EVENT_TYPES["面试"],
+            "Offer": ("Offer",),
+        }
+        with self.connection() as conn:
+            return {
+                stage: conn.execute(
+                    f"SELECT COUNT(DISTINCT application_id) FROM application_events WHERE event_type IN ({','.join('?' for _ in event_types)})",
+                    event_types,
+                ).fetchone()[0]
+                for stage, event_types in groups.items()
+            }
+
+    def progress_calendar(self, year: int, month: int) -> list[dict[str, object]]:
+        """Build a local-only calendar projection from existing application data."""
+        entries: dict[str, list[dict[str, str]]] = {}
+
+        def add(day_value: str | None, kind: str, label: str, application_id: int) -> None:
+            if not day_value:
+                return
+            try:
+                day = date.fromisoformat(day_value[:10]).isoformat()
+            except ValueError:
+                return
+            entries.setdefault(day, []).append({"kind": kind, "label": label, "application_id": str(application_id)})
+
+        for application in self.list_progress_applications():
+            label = f"{application['company']} · {application['title']}"
+            add(application["deadline"], "deadline", f"DDL · {label}", application["id"])
+            add(application["next_action_due_at"], "next-action", f"下一步 · {label}", application["id"])
+            for event in self.application_events(application["id"]):
+                if event["event_type"] in STAGE_EVENT_TYPES["面试"]:
+                    kind = "interview"
+                elif event["event_type"] in STAGE_EVENT_TYPES["测评/笔试"]:
+                    kind = "assessment"
+                elif event["event_type"] == "已投递":
+                    kind = "applied"
+                else:
+                    kind = "event"
+                add(event["event_date"], kind, f"{event['event_type']} · {label}", application["id"])
+
+        cells: list[dict[str, object]] = []
+        for week in calendar_module.Calendar(firstweekday=0).monthdatescalendar(year, month):
+            for day in week:
+                cells.append({"date": day.isoformat(), "day": day.day, "outside": day.month != month, "events": entries.get(day.isoformat(), [])})
+        return cells
+
+    @staticmethod
+    def _default_event_description(target_status: str, event_type: str) -> str:
+        return f"状态更新为{target_status}" if event_type not in {"备注", "补充材料", "其他记录"} else event_type
+
+    def _insert_event(self, conn: sqlite3.Connection, app_id: int, event_type: str, event_date: str, description: str = "") -> None:
+        if event_type not in EVENT_TYPES:
+            raise ValueError("无效的事件类型")
+        stamp = datetime.now().isoformat(timespec="seconds")
+        conn.execute("INSERT INTO application_events(application_id,event_type,event_date,description,created_at) VALUES(?,?,?,?,?)", (app_id,event_type,event_date,description.strip() or self._default_event_description("当前阶段", event_type),stamp))
+
+    def advance_application(self, app_id: int, target_status: str, event_type: str, event_date: str, description: str = "") -> str:
+        if target_status not in PROGRESS_STATUSES:
+            raise ValueError("无效的目标阶段")
+        with self.connection() as conn:
+            app = conn.execute("SELECT * FROM applications WHERE id=?", (app_id,)).fetchone()
+            if not app:
+                raise ValueError("投递记录不存在")
+            if target_status not in ADVANCE_TARGETS.get(app["status"], ()):
+                raise ValueError("不能回退到更早阶段")
+            if event_type not in STAGE_EVENT_TYPES[target_status]:
+                raise ValueError("该事件类型不属于目标阶段")
+            self._insert_event(conn, app_id, event_type, event_date, description or self._default_event_description(target_status, event_type))
+            if target_status != app["status"]:
+                conn.execute("UPDATE applications SET status=?,updated_at=? WHERE id=?", (target_status,datetime.now().isoformat(timespec="seconds"),app_id))
+        return target_status
+
+    def add_application_event(self, app_id: int, event_type: str, event_date: str, description: str = "") -> None:
+        with self.connection() as conn:
+            if not conn.execute("SELECT 1 FROM applications WHERE id=?", (app_id,)).fetchone():
+                raise ValueError("投递记录不存在")
+            self._insert_event(conn, app_id, event_type, event_date, description)
 
     def toggle_item(self, item_id: int):
             with self.connection() as conn: conn.execute("UPDATE checklist_items SET is_completed=1-is_completed,updated_at=? WHERE id=? AND NOT (is_predefined=1 AND sort_order=5)",(datetime.now().isoformat(timespec="seconds"),item_id))
@@ -211,10 +357,18 @@ class JobStore:
         with self.connection() as conn:
             app=conn.execute("SELECT * FROM applications WHERE id=?",(app_id,)).fetchone()
             if not app or app["status"] != "待投递": return False
-            conn.execute("UPDATE applications SET status='已投递',applied_at=?,updated_at=? WHERE id=?",(datetime.now().isoformat(timespec="seconds"),datetime.now().isoformat(timespec="seconds"),app_id)); return True
+            stamp = datetime.now().isoformat(timespec="seconds")
+            conn.execute("UPDATE applications SET status='已投递',applied_at=?,updated_at=? WHERE id=?",(stamp,stamp,app_id))
+            self._insert_event(conn, app_id, "已投递", stamp, "用户确认已在官方渠道提交申请")
+            return True
 
-    def withdraw_application(self,app_id:int):
-        with self.connection() as conn: conn.execute("UPDATE applications SET status='待投递',applied_at=NULL,updated_at=? WHERE id=?",(datetime.now().isoformat(timespec="seconds"),app_id))
+    def withdraw_application(self,app_id:int) -> bool:
+        with self.connection() as conn:
+            app = conn.execute("SELECT status FROM applications WHERE id=?", (app_id,)).fetchone()
+            if not app or app["status"] != "已投递":
+                return False
+            conn.execute("UPDATE applications SET status='待投递',applied_at=NULL,updated_at=? WHERE id=?",(datetime.now().isoformat(timespec="seconds"),app_id))
+            return True
 
     def create_manual_application(self, data: dict[str,str]) -> int:
         job_id=self.create(data)
@@ -222,6 +376,7 @@ class JobStore:
         with self.connection() as conn:
             stamp=datetime.now().isoformat(timespec="seconds")
             conn.execute("UPDATE applications SET status='已投递',applied_at=?,updated_at=? WHERE id=?",(stamp,stamp,app_id))
+            self._insert_event(conn, app_id, "已投递", stamp, "用户手动记录已完成投递")
         return app_id
 
 
@@ -252,6 +407,33 @@ def deadline_countdown(deadline: str | None) -> str:
     if days == 0:
         return "今日截止"
     return f"{days} 天后截止"
+
+
+def valid_event_datetime(value: str) -> bool:
+    if not value:
+        return False
+    try:
+        datetime.fromisoformat(value)
+        return True
+    except ValueError:
+        try:
+            date.fromisoformat(value)
+            return True
+        except ValueError:
+            return False
+
+
+def friendly_datetime(value: str | None) -> str:
+    if not value:
+        return "未记录"
+    try:
+        parsed = datetime.fromisoformat(value)
+        return parsed.strftime("%m-%d %H:%M")
+    except ValueError:
+        try:
+            return date.fromisoformat(value).strftime("%m-%d")
+        except ValueError:
+            return value
 
 
 def created_ago(created_at: str | None) -> str:
@@ -285,6 +467,7 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
     templates.env.globals["deadline_state"] = deadline_state
     templates.env.globals["deadline_countdown"] = deadline_countdown
     templates.env.globals["created_ago"] = created_ago
+    templates.env.globals["friendly_datetime"] = friendly_datetime
 
     def render_form(request: Request, *, form=None, errors=None, duplicate=None, editing=None, success=None):
         return templates.TemplateResponse(
@@ -410,14 +593,82 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
 
     @app.post("/applications/{app_id}/withdraw")
     def withdraw_application_route(request:Request,app_id:int,confirmed:str=Form("false")):
-        if confirmed.strip().lower() in {"true", "1", "on", "yes"}: request.app.state.store.withdraw_application(app_id); return RedirectResponse(url="/applications?message=已撤回至待投递",status_code=303)
-        return RedirectResponse(url="/applications?tab=sent&message=请确认撤回操作",status_code=303)
+        if confirmed.strip().lower() in {"true", "1", "on", "yes"} and request.app.state.store.withdraw_application(app_id):
+            return RedirectResponse(url="/applications?message=已撤回至待投递",status_code=303)
+        return RedirectResponse(url="/applications?tab=sent&message=仅已投递的记录可撤回",status_code=303)
 
     @app.post("/applications/manual")
     def manual_application(request:Request,company:str=Form(""),title:str=Form(""),city:str=Form(""),source:str=Form("其他"),application_url:str=Form("")):
         if not company.strip() or not title.strip() or not city.strip(): return RedirectResponse(url="/applications?message=请填写公司、岗位和地点",status_code=303)
         request.app.state.store.create_manual_application({"company":company.strip(),"title":title.strip(),"city":city.strip(),"source":source,"application_url":application_url.strip(),"salary_range":"","department":"","description_text":"","deadline":"","note":"手动记录已投递"})
         return RedirectResponse(url="/applications?tab=sent&message=已手动记录投递",status_code=303)
+
+    @app.get("/progress")
+    def application_progress(request: Request, state: str = "all", view: str = "list", year: int | None = None, month: int | None = None, focus: int | None = None, message: str = ""):
+        state = state if state in {"all", *PROGRESS_STATUSES} else "all"
+        view = view if view in {"list", "calendar"} else "list"
+        today_date = date.today()
+        year = year if year and 2000 <= year <= 2100 else today_date.year
+        month = month if month and 1 <= month <= 12 else today_date.month
+        month_start = date(year, month, 1)
+        previous_month = month_start - timedelta(days=1)
+        following_month = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
+        store = request.app.state.store
+        applications = store.list_progress_applications(state)
+        context = {
+            "applications": applications,
+            "events": {row["id"]: store.application_events(row["id"]) for row in applications},
+            "state": state,
+            "view": view,
+            "counts": store.progress_counts(),
+            "funnel": store.funnel(),
+            "focus": focus,
+            "message": message,
+            "today": today_date.isoformat(),
+            "stage_event_types": STAGE_EVENT_TYPES,
+            "event_types": EVENT_TYPES,
+            "advance_targets": ADVANCE_TARGETS,
+            "calendar_cells": store.progress_calendar(year, month),
+            "calendar_year": year,
+            "calendar_month": month,
+            "previous_month": previous_month,
+            "following_month": following_month,
+        }
+        return templates.TemplateResponse(request, "calendar.html" if view == "calendar" else "progress.html", context)
+
+    @app.post("/progress/{app_id}/advance")
+    def advance_progress(request: Request, app_id: int, target_status: str = Form(""), event_type: str = Form(""), event_date: str = Form(""), description: str = Form("")):
+        if not valid_event_datetime(event_date):
+            return RedirectResponse(url=f"/progress?focus={app_id}&message=请输入有效的事件日期", status_code=303)
+        try:
+            target = request.app.state.store.advance_application(app_id, target_status, event_type, event_date, description)
+            app = request.app.state.store.application_by_id(app_id)
+            job = request.app.state.store.get(app["job_id"]) if app else None
+            message = f"已更新：{job['company']} · {job['title']} → {target}" if job else "申请进度已更新"
+        except ValueError as error:
+            message = str(error)
+        return RedirectResponse(url=f"/progress?focus={app_id}&message={message}", status_code=303)
+
+    @app.post("/progress/{app_id}/events")
+    def add_progress_event(request: Request, app_id: int, event_type: str = Form(""), event_date: str = Form(""), description: str = Form("")):
+        if not valid_event_datetime(event_date):
+            return RedirectResponse(url=f"/progress?focus={app_id}&message=请输入有效的事件日期", status_code=303)
+        try:
+            request.app.state.store.add_application_event(app_id, event_type, event_date, description)
+            message = "事件已添加"
+        except ValueError as error:
+            message = str(error)
+        return RedirectResponse(url=f"/progress?focus={app_id}&message={message}", status_code=303)
+
+    @app.post("/progress/{app_id}/next-action")
+    def save_progress_next_action(request: Request, app_id: int, next_action: str = Form(""), next_action_due_at: str = Form("")):
+        if next_action_due_at and not valid_event_datetime(next_action_due_at):
+            return RedirectResponse(url=f"/progress?focus={app_id}&message=请输入有效的计划时间", status_code=303)
+        app = request.app.state.store.application_by_id(app_id)
+        if not app:
+            raise HTTPException(status_code=404, detail="投递记录不存在")
+        request.app.state.store.save_application(app_id, app["resume_version"] or "", next_action, app["notes"] or "", next_action_due_at)
+        return RedirectResponse(url=f"/progress?focus={app_id}&message=下一步行动已保存", status_code=303)
 
     @app.get("/profile")
     def profile_page(request: Request):
