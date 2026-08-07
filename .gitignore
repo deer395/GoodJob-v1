@@ -3,6 +3,11 @@ manual_capture/*.db
 manual_capture/*.db-shm
 manual_capture/*.db-wal
 
+# Local API credentials
+.env
+.env.*
+!.env.example
+
 # Python caches and local environments
 __pycache__/
 **/__pycache__/

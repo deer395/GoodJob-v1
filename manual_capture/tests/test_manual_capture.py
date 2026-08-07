@@ -1,10 +1,13 @@
 from datetime import date, timedelta
+from io import BytesIO
+import json
 
 import pytest
 
 from fastapi.testclient import TestClient
 
 from manual_capture.app import create_app
+from manual_capture.import_routes import default_mapping
 
 
 def client(tmp_path):
@@ -250,3 +253,149 @@ def test_progress_calendar_projects_existing_events_deadlines_and_plan_time(tmp_
     assert "DDL · 字节跳动 · 产品经理" in calendar_page.text
     assert "一面 · 字节跳动 · 产品经理" in calendar_page.text
     assert "下一步 · 字节跳动 · 产品经理" in calendar_page.text
+
+
+def test_xlsx_import_maps_dates_tracks_batch_and_preserves_protected_fields(tmp_path):
+    from openpyxl import Workbook
+
+    test_client = client(tmp_path)
+    test_client.post("/jobs", data=payload(department="用户维护部门", note="不可覆盖"))
+    existing_id = test_client.app.state.store.list()[0]["id"]
+    test_client.post(f"/jobs/{existing_id}/favorite")
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["公司", "岗位", "城市", "截止日期", "来源", "链接"])
+    sheet.append(["字节跳动", "产品经理", "北京", "8.15", "官网", "https://jobs.example.com/new"])
+    sheet.append(["腾讯", "后端开发", "深圳", "2026-08-16", "公众号", ""])
+    content = BytesIO()
+    workbook.save(content)
+    upload = test_client.post("/import/upload", files={"file": ("jobs.xlsx", content.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+    assert upload.status_code == 200 and "确认列映射" in upload.text
+    token = next(iter(test_client.app.state.import_cache))
+    mapping = {"公司": "company", "岗位": "title", "城市": "city", "截止日期": "deadline", "来源": "source", "链接": "application_url"}
+    preview = test_client.post("/import/preview", data={"token": token, "default_year": "2026", "mapping_json": json.dumps(mapping, ensure_ascii=False)})
+    assert "库内重复" in preview.text and "2026-08-15" in preview.text
+    result = test_client.post("/import/execute", data={"token": token, "default_year": "2026", "mapping_json": json.dumps(mapping, ensure_ascii=False), "actions_json": json.dumps({"1": "update", "2": "create"})}, follow_redirects=True)
+    assert "新增 1 条、更新 1 条、跳过 0 条" in result.text
+    existing = test_client.app.state.store.get(existing_id)
+    assert existing["is_favorite"] == 1 and existing["department"] == "用户维护部门" and existing["note"] == "不可覆盖"
+    assert existing["application_url"] == "https://jobs.example.com/new"
+    batches = test_client.app.state.store.list_import_batches()
+    assert len(batches) == 1 and batches[0]["created_count"] == 1 and batches[0]["updated_count"] == 1
+    assert all(job["source_import_id"] == batches[0]["id"] for job in test_client.app.state.store.list())
+
+
+def test_import_marks_missing_year_and_rolls_back_invalid_rows(tmp_path):
+    test_client = client(tmp_path)
+    source = "公司,岗位,城市,DDL\n网易,算法工程师,杭州,8.15\n"
+    test_client.post("/import/upload", files={"file": ("jobs.csv", source.encode(), "text/csv")})
+    token = next(iter(test_client.app.state.import_cache))
+    mapping = {"公司": "company", "岗位": "title", "城市": "city", "DDL": "deadline"}
+    preview = test_client.post("/import/preview", data={"token": token, "default_year": "", "mapping_json": json.dumps(mapping, ensure_ascii=False)})
+    assert "缺少年份" in preview.text
+    response = test_client.post("/import/execute", data={"token": token, "default_year": "", "mapping_json": json.dumps(mapping, ensure_ascii=False), "actions_json": "{}"})
+    assert "第 1 行：缺少年份" in response.text
+    assert test_client.app.state.store.list() == [] and test_client.app.state.store.list_import_batches() == []
+
+
+def test_xlsx_import_selects_data_sheet_and_skips_preface_rows(tmp_path):
+    from openpyxl import Workbook
+
+    test_client = client(tmp_path)
+    workbook = Workbook()
+    cover = workbook.active
+    cover.title = "更新说明"
+    cover.append(["更新时间"])
+    cover.append(["2026-08-06"])
+    sheet = workbook.create_sheet("校招汇总表")
+    sheet.append(["2027 秋招汇总，持续更新"])
+    sheet.append([])
+    sheet.append(["更新时间", "公司", "岗位", "城市", "截止日期"])
+    sheet.append(["2026-08-06", "腾讯", "产品经理", "深圳", "2026/08/20"])
+    sheet.append(["2026-08-06", "网易", "算法工程师", "杭州", "8.21"])
+    content = BytesIO()
+    workbook.save(content)
+    response = test_client.post("/import/upload", files={"file": ("realistic.xlsx", content.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+    assert "工作表：校招汇总表" in response.text
+    token = next(iter(test_client.app.state.import_cache))
+    cached = test_client.app.state.import_cache[token]
+    assert cached["headers"] == ["更新时间", "公司", "岗位", "城市", "截止日期"]
+    assert len(cached["rows"]) == 2
+
+
+def test_xlsx_import_resets_stale_dimension_and_accepts_large_local_batch(tmp_path):
+    from openpyxl import Workbook
+
+    test_client = client(tmp_path)
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["公司", "招聘岗位", "工作地点", "截止时间", "简历投递链接"])
+    for number in range(659):
+        sheet.append([f"公司{number}", "产品经理", "上海", "招满为止" if number % 2 else "2026/08/20", "https://jobs.example.com/apply"])
+    content = BytesIO()
+    workbook.save(content)
+    response = test_client.post("/import/upload", files={"file": ("large.xlsx", content.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+    assert response.status_code == 200 and "确认列映射" in response.text
+    token = next(iter(test_client.app.state.import_cache))
+    cached = test_client.app.state.import_cache[token]
+    assert len(cached["rows"]) == 659
+    assert cached["headers"] == ["公司", "招聘岗位", "工作地点", "截止时间", "简历投递链接"]
+    assert "application_url" in default_mapping(cached["headers"]).values()
+
+
+def test_import_skips_invalid_rows_outside_the_first_ten_previewed_rows(tmp_path):
+    test_client = client(tmp_path)
+    rows = ["公司,岗位,城市"] + [f"公司{index},产品经理,上海" for index in range(11)] + ["缺岗位公司,,北京"]
+    test_client.post("/import/upload", files={"file": ("invalid-late.csv", "\n".join(rows).encode(), "text/csv")})
+    token = next(iter(test_client.app.state.import_cache))
+    mapping = {"公司": "company", "岗位": "title", "城市": "city"}
+    preview = test_client.post("/import/preview", data={"token": token, "default_year": "2027", "mapping_json": json.dumps(mapping, ensure_ascii=False)})
+    assert "其中 1 行缺少公司、岗位或城市，已默认跳过" in preview.text
+    completed = test_client.post("/import/execute", data={"token": token, "default_year": "2027", "mapping_json": json.dumps(mapping, ensure_ascii=False), "actions_json": "{}"}, follow_redirects=True)
+    assert "新增 11 条、更新 0 条、跳过 1 条" in completed.text
+
+
+def test_calendar_export_includes_only_eligible_entries_and_uses_crlf(tmp_path):
+    test_client = client(tmp_path)
+    future = (date.today() + timedelta(days=3)).isoformat()
+    test_client.post("/jobs", data=payload(company="待投递", deadline=future))
+    test_client.post("/jobs", data=payload(company="已投递", title="后端", deadline=future))
+    test_client.post("/jobs", data=payload(company="面试公司", title="算法", deadline=future))
+    store = test_client.app.state.store
+    test_client.post("/jobs/2/prepare")
+    assert store.confirm_application(1)
+    test_client.post("/jobs/3/prepare")
+    assert store.confirm_application(2)
+    store.advance_application(2, "面试", "一面", future, scheduled_at=f"{future}T14:00")
+    store.add_application_event(2, "二面", future, scheduled_at="")
+    store.save_application(2, "", "准备面试", "", f"{future}T09:00")
+    exported = test_client.get("/calendar/export?scope=future")
+    body = exported.content.decode()
+    assert exported.headers["content-type"].startswith("text/calendar")
+    assert "DDL：待投递 产品经理" in body and "DDL：已投递 后端" not in body
+    assert "一面：面试公司 算法" in body and "二面：面试公司 算法" not in body
+    assert "下一步：面试公司 算法" in body and "UID:campusai-event-" in body
+    assert "\r\n" in body and "\n" not in body.replace("\r\n", "")
+
+
+def test_calendar_export_excludes_notifications_applied_events_and_ended_applications(tmp_path):
+    test_client = client(tmp_path)
+    future = (date.today() + timedelta(days=4)).isoformat()
+    test_client.post("/jobs", data=payload(company="通知事件", deadline=future))
+    test_client.post("/jobs", data=payload(company="已结束事件", title="测试", deadline=future))
+    store = test_client.app.state.store
+    test_client.post("/jobs/1/prepare")
+    assert store.confirm_application(1)
+    store.add_application_event(1, "笔试通知", future, scheduled_at=f"{future}T10:00")
+    store.add_application_event(1, "已投递", future, scheduled_at=f"{future}T11:00")
+    test_client.post("/jobs/2/prepare")
+    assert store.confirm_application(2)
+    store.advance_application(2, "面试", "一面", future, scheduled_at=f"{future}T14:00")
+    store.save_application(2, "", "已结束后不应导出", "", f"{future}T09:00")
+    store.advance_application(2, "已结束", "主动放弃", future)
+
+    body = test_client.get("/calendar/export?scope=future").content.decode()
+    assert "笔试通知：通知事件 产品经理" not in body
+    assert "已投递：通知事件 产品经理" not in body
+    assert "一面：已结束事件 测试" not in body
+    assert "下一步：已结束事件 测试" not in body

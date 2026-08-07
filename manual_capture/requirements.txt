@@ -1,6 +1,8 @@
 fastapi
+openpyxl
 uvicorn[standard]
 jinja2
 python-multipart
 alembic
 sqlalchemy
+python-dotenv

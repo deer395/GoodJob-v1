@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 import calendar as calendar_module
+import json
+import threading
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -12,6 +14,9 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from .matching import canonical_tags, configured, evaluate
+from .calendar_routes import create_calendar_router
+from .import_routes import create_import_router
+from .ai import AIUnavailable, EXTRACTION_PROMPT_VERSION, SEMANTIC_PROMPT_VERSION, OpenAIClient, config as ai_config, fingerprint
 
 BASE_DIR = Path(__file__).resolve().parent
 SOURCES = ("官网", "BOSS直聘", "牛客", "公众号", "其他")
@@ -44,6 +49,10 @@ class JobStore:
         connection.row_factory = sqlite3.Row
         try:
             yield connection
+        except Exception:
+            connection.rollback()
+            raise
+        else:
             connection.commit()
         finally:
             connection.close()
@@ -70,6 +79,7 @@ class JobStore:
                     duplicate_confirmed INTEGER NOT NULL DEFAULT 0,
                     match_score INTEGER,
                     match_reasons TEXT,
+                    source_import_id INTEGER,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -87,9 +97,27 @@ class JobStore:
             conn.execute("""CREATE TABLE IF NOT EXISTS application_events (
                 id INTEGER PRIMARY KEY, application_id INTEGER NOT NULL,
                 event_type TEXT NOT NULL, event_date TEXT NOT NULL,
-                description TEXT, created_at TEXT NOT NULL,
+                scheduled_at TEXT, description TEXT, created_at TEXT NOT NULL,
                 FOREIGN KEY(application_id) REFERENCES applications(id)
             )""")
+            job_columns = {row["name"] for row in conn.execute("PRAGMA table_info(job_postings)").fetchall()}
+            if "source_import_id" not in job_columns:
+                conn.execute("ALTER TABLE job_postings ADD COLUMN source_import_id INTEGER")
+            event_columns = {row["name"] for row in conn.execute("PRAGMA table_info(application_events)").fetchall()}
+            if "scheduled_at" not in event_columns:
+                conn.execute("ALTER TABLE application_events ADD COLUMN scheduled_at TEXT")
+            conn.execute("""CREATE TABLE IF NOT EXISTS import_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, filename TEXT NOT NULL, imported_at TEXT NOT NULL,
+                total_rows INTEGER NOT NULL, created_count INTEGER NOT NULL DEFAULT 0,
+                skipped_count INTEGER NOT NULL DEFAULT 0, updated_count INTEGER NOT NULL DEFAULT 0,
+                column_mapping TEXT NOT NULL, default_year TEXT, notes TEXT
+            )""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS ai_settings (id INTEGER PRIMARY KEY CHECK(id=1), ai_enabled INTEGER NOT NULL DEFAULT 0, extraction_consent_version TEXT, extraction_consented_at TEXT, semantic_consent_version TEXT, semantic_consented_at TEXT, extraction_last_used_at TEXT, semantic_last_used_at TEXT)""")
+            setting_columns = {row["name"] for row in conn.execute("PRAGMA table_info(ai_settings)").fetchall()}
+            for column in ("extraction_last_used_at", "semantic_last_used_at"):
+                if column not in setting_columns:
+                    conn.execute(f"ALTER TABLE ai_settings ADD COLUMN {column} TEXT")
+            conn.execute("""CREATE TABLE IF NOT EXISTS job_ai_analyses (id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL, ai_score INTEGER NOT NULL, reasons TEXT NOT NULL, risks TEXT NOT NULL, model_name TEXT NOT NULL, created_at TEXT NOT NULL, prompt_version TEXT NOT NULL, input_fingerprint TEXT NOT NULL)""")
             self._backfill_applied_events(conn)
 
     @staticmethod
@@ -121,6 +149,40 @@ class JobStore:
         with self.connection() as conn:
             return conn.execute("SELECT * FROM candidate_profiles WHERE id=1").fetchone()
 
+    def ai_settings(self):
+        with self.connection() as conn:
+            conn.execute("INSERT OR IGNORE INTO ai_settings(id) VALUES(1)")
+            return conn.execute("SELECT * FROM ai_settings WHERE id=1").fetchone()
+
+    def save_ai_settings(self, enabled: bool) -> None:
+        with self.connection() as conn:
+            conn.execute("INSERT OR IGNORE INTO ai_settings(id) VALUES(1)")
+            conn.execute("UPDATE ai_settings SET ai_enabled=? WHERE id=1", (int(enabled),))
+
+    def consent_ai(self, capability: str) -> None:
+        column = "extraction" if capability == "extraction" else "semantic"
+        with self.connection() as conn:
+            conn.execute("INSERT OR IGNORE INTO ai_settings(id) VALUES(1)")
+            conn.execute(f"UPDATE ai_settings SET {column}_consent_version=?, {column}_consented_at=? WHERE id=1", ("v1", datetime.now().isoformat(timespec="seconds")))
+
+    def mark_ai_used(self, capability: str) -> None:
+        column = "extraction" if capability == "extraction" else "semantic"
+        with self.connection() as conn:
+            conn.execute("INSERT OR IGNORE INTO ai_settings(id) VALUES(1)")
+            conn.execute(f"UPDATE ai_settings SET {column}_last_used_at=? WHERE id=1", (datetime.now().isoformat(timespec="seconds"),))
+
+    def latest_ai_analysis(self, job_id: int):
+        with self.connection() as conn:
+            return conn.execute("SELECT * FROM job_ai_analyses WHERE job_id=? ORDER BY id DESC LIMIT 1", (job_id,)).fetchone()
+
+    def cached_ai_analysis(self, job_id: int, input_fingerprint: str):
+        with self.connection() as conn:
+            return conn.execute("SELECT * FROM job_ai_analyses WHERE job_id=? AND input_fingerprint=? AND prompt_version=? ORDER BY id DESC LIMIT 1", (job_id, input_fingerprint, SEMANTIC_PROMPT_VERSION)).fetchone()
+
+    def save_ai_analysis(self, job_id: int, result, input_fingerprint: str) -> None:
+        with self.connection() as conn:
+            conn.execute("INSERT INTO job_ai_analyses(job_id,ai_score,reasons,risks,model_name,created_at,prompt_version,input_fingerprint) VALUES(?,?,?,?,?,?,?,?)", (job_id, result.ai_score, json.dumps(result.reasons, ensure_ascii=False), json.dumps(result.risks, ensure_ascii=False), ai_config().model, datetime.now().isoformat(timespec="seconds"), SEMANTIC_PROMPT_VERSION, input_fingerprint))
+
     def save_profile(self, data: dict[str, str]) -> None:
         stamp = datetime.now().isoformat(timespec="seconds")
         fields = "graduation_year,degree,school,major,target_cities,target_directions,target_industries,skills,constraints"
@@ -135,10 +197,15 @@ class JobStore:
     def recompute_matches(self) -> None:
         profile = self.profile()
         with self.connection() as conn:
-            rows = conn.execute("SELECT * FROM job_postings").fetchall()
-            for row in rows:
-                score, reasons = evaluate(dict(row), dict(profile) if profile else None)
-                conn.execute("UPDATE job_postings SET match_score=?,match_reasons=?,updated_at=? WHERE id=?", (score, reasons, datetime.now().isoformat(timespec="seconds"), row["id"]))
+            self.recompute_matches_in_connection(conn, profile)
+
+    def recompute_matches_in_connection(self, conn: sqlite3.Connection, profile=None) -> None:
+        if profile is None:
+            profile = conn.execute("SELECT * FROM candidate_profiles WHERE id=1").fetchone()
+        rows = conn.execute("SELECT * FROM job_postings").fetchall()
+        for row in rows:
+            score, reasons = evaluate(dict(row), dict(profile) if profile else None)
+            conn.execute("UPDATE job_postings SET match_score=?,match_reasons=?,updated_at=? WHERE id=?", (score, reasons, datetime.now().isoformat(timespec="seconds"), row["id"]))
 
     def list(self, query: str = "", state_filter: str = "all", sort: str = "priority"):
         clauses: list[str] = []
@@ -308,17 +375,76 @@ class JobStore:
                 cells.append({"date": day.isoformat(), "day": day.day, "outside": day.month != month, "events": entries.get(day.isoformat(), [])})
         return cells
 
+    def create_import_batch(self, conn: sqlite3.Connection, filename: str, total_rows: int, mapping: dict[str, str], default_year: str) -> int:
+        cursor = conn.execute("""INSERT INTO import_batches(filename,imported_at,total_rows,column_mapping,default_year)
+            VALUES(?,?,?,?,?)""", (filename, datetime.now().isoformat(timespec="seconds"), total_rows, json.dumps(mapping, ensure_ascii=False), default_year or None))
+        return int(cursor.lastrowid)
+
+    def finish_import_batch(self, conn: sqlite3.Connection, batch_id: int, counts: dict[str, int]) -> None:
+        conn.execute("UPDATE import_batches SET created_count=?,skipped_count=?,updated_count=? WHERE id=?", (counts["created"], counts["skipped"], counts["updated"], batch_id))
+
+    def create_from_import(self, conn: sqlite3.Connection, data: dict[str, str], batch_id: int, duplicate_confirmed: bool) -> int:
+        stamp = datetime.now().isoformat(timespec="seconds")
+        cursor = conn.execute("""INSERT INTO job_postings(company,title,city,application_url,salary_range,department,deadline,source,note,status,duplicate_confirmed,source_import_id,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,'待评估',?,?,?,?)""", (data["company"], data["title"], data["city"], data["application_url"], data["salary_range"], data["department"], data["deadline"], data["source"] if data["source"] in SOURCES else "其他", data["note"], int(duplicate_confirmed), batch_id, stamp, stamp))
+        return int(cursor.lastrowid)
+
+    def update_from_import(self, conn: sqlite3.Connection, job_id: int, data: dict[str, str], batch_id: int) -> None:
+        existing = conn.execute("SELECT * FROM job_postings WHERE id=?", (job_id,)).fetchone()
+        if not existing:
+            raise ValueError("要覆盖的岗位不存在")
+        values = {field: data[field] for field in ("company", "title", "city", "application_url", "salary_range", "deadline", "source") if data[field]}
+        if "source" in values and values["source"] not in SOURCES:
+            values["source"] = "其他"
+        values["source_import_id"] = batch_id
+        values["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        assignments = ", ".join(f"{field}=?" for field in values)
+        conn.execute(f"UPDATE job_postings SET {assignments} WHERE id=?", (*values.values(), job_id))
+
+    def list_import_batches(self):
+        with self.connection() as conn:
+            return conn.execute("SELECT * FROM import_batches ORDER BY imported_at DESC,id DESC").fetchall()
+
+    def get_import_batch(self, batch_id: int):
+        with self.connection() as conn:
+            return conn.execute("SELECT * FROM import_batches WHERE id=?", (batch_id,)).fetchone()
+
+    def calendar_export_entries(self, scope: str, today: date) -> list[dict[str, str]]:
+        with self.connection() as conn:
+            deadlines = conn.execute("""SELECT j.id,j.company,j.title,j.deadline FROM job_postings j
+                LEFT JOIN applications a ON a.job_id=j.id
+                WHERE j.deadline <> '' AND (a.id IS NULL OR a.status='待投递')""").fetchall()
+            events = conn.execute("""SELECT e.id,e.scheduled_at,e.event_type,j.company,j.title FROM application_events e
+                JOIN applications a ON a.id=e.application_id JOIN job_postings j ON j.id=a.job_id
+                WHERE e.event_type IN ('其他测评','一面','二面','三面','HR面','其他面试')
+                  AND e.scheduled_at IS NOT NULL AND e.scheduled_at <> ''
+                  AND a.status <> '已结束'""").fetchall()
+            actions = conn.execute("""SELECT a.id,a.next_action_due_at,j.company,j.title FROM applications a
+                JOIN job_postings j ON j.id=a.job_id
+                WHERE a.next_action_due_at IS NOT NULL AND a.next_action_due_at <> ''
+                  AND a.status <> '已结束'""").fetchall()
+        items = []
+        for row in deadlines:
+            items.append({"source": "deadline", "id": str(row["id"]), "date": row["deadline"][:10], "title": f"DDL：{row['company']} {row['title']}"})
+        for row in events:
+            items.append({"source": "event", "id": str(row["id"]), "date": row["scheduled_at"][:10], "title": f"{row['event_type']}：{row['company']} {row['title']}"})
+        for row in actions:
+            items.append({"source": "nextaction", "id": str(row["id"]), "date": row["next_action_due_at"][:10], "title": f"下一步：{row['company']} {row['title']}"})
+        if scope == "future":
+            items = [item for item in items if item["date"] >= today.isoformat()]
+        return sorted(items, key=lambda item: (item["date"], item["source"], item["id"]))
+
     @staticmethod
     def _default_event_description(target_status: str, event_type: str) -> str:
         return f"状态更新为{target_status}" if event_type not in {"备注", "补充材料", "其他记录"} else event_type
 
-    def _insert_event(self, conn: sqlite3.Connection, app_id: int, event_type: str, event_date: str, description: str = "") -> None:
+    def _insert_event(self, conn: sqlite3.Connection, app_id: int, event_type: str, event_date: str, description: str = "", scheduled_at: str = "") -> None:
         if event_type not in EVENT_TYPES:
             raise ValueError("无效的事件类型")
         stamp = datetime.now().isoformat(timespec="seconds")
-        conn.execute("INSERT INTO application_events(application_id,event_type,event_date,description,created_at) VALUES(?,?,?,?,?)", (app_id,event_type,event_date,description.strip() or self._default_event_description("当前阶段", event_type),stamp))
+        conn.execute("INSERT INTO application_events(application_id,event_type,event_date,scheduled_at,description,created_at) VALUES(?,?,?,?,?,?)", (app_id,event_type,event_date,scheduled_at.strip() or None,description.strip() or self._default_event_description("当前阶段", event_type),stamp))
 
-    def advance_application(self, app_id: int, target_status: str, event_type: str, event_date: str, description: str = "") -> str:
+    def advance_application(self, app_id: int, target_status: str, event_type: str, event_date: str, description: str = "", scheduled_at: str = "") -> str:
         if target_status not in PROGRESS_STATUSES:
             raise ValueError("无效的目标阶段")
         with self.connection() as conn:
@@ -329,16 +455,16 @@ class JobStore:
                 raise ValueError("不能回退到更早阶段")
             if event_type not in STAGE_EVENT_TYPES[target_status]:
                 raise ValueError("该事件类型不属于目标阶段")
-            self._insert_event(conn, app_id, event_type, event_date, description or self._default_event_description(target_status, event_type))
+            self._insert_event(conn, app_id, event_type, event_date, description or self._default_event_description(target_status, event_type), scheduled_at)
             if target_status != app["status"]:
                 conn.execute("UPDATE applications SET status=?,updated_at=? WHERE id=?", (target_status,datetime.now().isoformat(timespec="seconds"),app_id))
         return target_status
 
-    def add_application_event(self, app_id: int, event_type: str, event_date: str, description: str = "") -> None:
+    def add_application_event(self, app_id: int, event_type: str, event_date: str, description: str = "", scheduled_at: str = "") -> None:
         with self.connection() as conn:
             if not conn.execute("SELECT 1 FROM applications WHERE id=?", (app_id,)).fetchone():
                 raise ValueError("投递记录不存在")
-            self._insert_event(conn, app_id, event_type, event_date, description)
+            self._insert_event(conn, app_id, event_type, event_date, description, scheduled_at)
 
     def toggle_item(self, item_id: int):
             with self.connection() as conn: conn.execute("UPDATE checklist_items SET is_completed=1-is_completed,updated_at=? WHERE id=? AND NOT (is_predefined=1 AND sort_order=5)",(datetime.now().isoformat(timespec="seconds"),item_id))
@@ -459,23 +585,40 @@ def clean_form(data: dict[str, str]) -> dict[str, str]:
     return {field: (data.get(field) or "").strip() for field in fields}
 
 
+def semantic_payload(job: dict, profile: dict) -> dict:
+    """Minimum allowlist for direction/skill matching; school is intentionally excluded."""
+    return {
+        "job": {key: str(job.get(key) or "")[:4000] for key in ("title", "city", "department", "description_text", "note")},
+        "candidate": {key: str(profile.get(key) or "")[:500] for key in ("graduation_year", "degree", "major", "target_cities", "target_directions", "skills")},
+    }
+
+
 def create_app(db_path: Path | str | None = None) -> FastAPI:
     app = FastAPI(title="GoodJobAI · 手动收录岗位")
     app.state.store = JobStore(db_path or BASE_DIR / "campusai_manual.db")
+    app.state.import_cache = {}
+    app.state.ai_client = OpenAIClient()
+    app.state.ai_inflight = set()
+    app.state.ai_lock = threading.Lock()
     app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
     templates = Jinja2Templates(directory=BASE_DIR / "templates")
     templates.env.globals["deadline_state"] = deadline_state
     templates.env.globals["deadline_countdown"] = deadline_countdown
     templates.env.globals["created_ago"] = created_ago
     templates.env.globals["friendly_datetime"] = friendly_datetime
+    app.include_router(create_import_router(templates))
+    app.include_router(create_calendar_router())
 
-    def render_form(request: Request, *, form=None, errors=None, duplicate=None, editing=None, success=None):
+    def render_form(request: Request, *, form=None, errors=None, duplicate=None, editing=None, success=None, ai_message="", ai_prefilled=(), ai_evidence=None, jd_text="", extraction_consent=False):
+        settings = request.app.state.store.ai_settings()
         return templates.TemplateResponse(
             request,
             "capture.html",
             {
                 "sources": SOURCES, "form": form or {"source": "官网"}, "errors": errors or {},
-                "duplicate": duplicate, "editing": editing, "success": success,
+                "duplicate": duplicate, "editing": editing, "success": success, "ai_configured": ai_config().configured,
+                "ai_enabled": bool(settings["ai_enabled"]), "ai_message": ai_message or ("AI 已配置但尚未启用，请在导航栏的“AI 设置”开启。" if ai_config().configured and not settings["ai_enabled"] else ""), "ai_prefilled": ai_prefilled,
+                "ai_evidence": ai_evidence or {}, "jd_text": jd_text, "extraction_consent": extraction_consent,
             },
         )
 
@@ -487,6 +630,44 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
             if job:
                 success = job
         return render_form(request, success=success)
+
+    @app.post("/ai/extract")
+    def ai_extract(request: Request, jd_text: str = Form(""), confirm_consent: str = Form("")):
+        jd_text = jd_text.strip()
+        settings = request.app.state.store.ai_settings()
+        if not ai_config().configured:
+            return render_form(request, jd_text=jd_text, ai_message="AI 尚未配置")
+        if not settings["ai_enabled"]:
+            return render_form(request, jd_text=jd_text, ai_message="请先在 AI 设置中启用 AI")
+        if not jd_text or len(jd_text) > 12000:
+            return render_form(request, jd_text=jd_text, ai_message="JD 正文不能为空且最多 12000 字")
+        if not settings["extraction_consented_at"] and confirm_consent.lower() not in {"1", "true", "on"}:
+            return render_form(request, jd_text=jd_text, extraction_consent=True)
+        if not settings["extraction_consented_at"]:
+            request.app.state.store.consent_ai("extraction")
+        with request.app.state.ai_lock:
+            if "extract" in request.app.state.ai_inflight:
+                return render_form(request, jd_text=jd_text, ai_message="智能提取正在进行，请勿重复提交")
+            request.app.state.ai_inflight.add("extract")
+        try:
+            result = request.app.state.ai_client.extract(jd_text)
+            request.app.state.store.mark_ai_used("extraction")
+        except AIUnavailable:
+            return render_form(request, jd_text=jd_text, ai_message="智能提取暂不可用，请手动填写。")
+        finally:
+            with request.app.state.ai_lock: request.app.state.ai_inflight.discard("extract")
+        values, evidence = {}, {}
+        for field in ("company", "title", "city", "department", "salary_range"):
+            item = getattr(result, field); values[field] = item.value or ""; evidence[field] = item.evidence or ""
+        item = result.deadline; evidence["deadline"] = item.evidence or ""
+        try:
+            values["deadline"] = date.fromisoformat(item.value).isoformat() if item.value else ""
+        except ValueError:
+            values["deadline"] = ""
+            if item.evidence: evidence["deadline"] = "需人工确认：" + item.evidence
+        evidence["graduation_year"] = getattr(result.graduation_year, "evidence", "") or ""
+        message = "可能包含多个岗位，请拆分后分别核对填写。" if result.multiple_roles_detected else "已预填 AI 提取结果；请核对后手动保存。"
+        return render_form(request, form={"source": "官网", **values, "description_text": jd_text}, ai_prefilled=tuple(values), ai_evidence=evidence, jd_text=jd_text, ai_message=message)
 
     @app.post("/jobs")
     def save_job(
@@ -526,7 +707,7 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
         return RedirectResponse(url=f"/?saved={created_id}", status_code=303)
 
     @app.get("/jobs")
-    def job_pool(request: Request, q: str = "", state: str = "all", sort: str = "priority", deleted: bool = False):
+    def job_pool(request: Request, q: str = "", state: str = "all", sort: str = "priority", deleted: bool = False, imported: int | None = None, updated: int | None = None, skipped: int | None = None, focus: int | None = None):
         state = state if state in {"all", "pending", "near", "expired", "today", "week", "favorite", "high"} else "all"
         store = request.app.state.store
         profile = store.profile()
@@ -540,11 +721,55 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
             "week": sum(bool(job["deadline"]) and 0 <= (date.fromisoformat(job["deadline"]) - today).days <= 6 for job in all_jobs),
             "favorite": sum(bool(job["is_favorite"]) for job in all_jobs),
         }
+        jobs = store.list(q.strip(), state, sort)
+        settings = store.ai_settings()
+        analyses = {}
+        for job in jobs:
+            analysis = store.latest_ai_analysis(job["id"])
+            if analysis:
+                payload = semantic_payload(dict(job), dict(profile) if profile else {})
+                analyses[job["id"]] = {**dict(analysis), "reasons": json.loads(analysis["reasons"]), "risks": json.loads(analysis["risks"]), "stale": analysis["input_fingerprint"] != fingerprint(payload, SEMANTIC_PROMPT_VERSION), "payload": payload}
         return templates.TemplateResponse(
             request,
             "pool.html",
-            {"jobs": store.list(q.strip(), state, sort), "q": q.strip(), "state": state, "deleted": deleted, "profile_configured": profile_configured, "profile": profile, "sort": sort, "metrics": metrics},
+            {"jobs": jobs, "q": q.strip(), "state": state, "deleted": deleted, "imported": imported, "updated": updated, "skipped": skipped, "profile_configured": profile_configured, "profile": profile, "sort": sort, "metrics": metrics, "ai_enabled": bool(settings["ai_enabled"]), "ai_configured": ai_config().configured, "analyses": analyses, "focus": focus},
         )
+
+    @app.get("/ai-settings")
+    def ai_settings_page(request: Request):
+        return templates.TemplateResponse(request, "ai_settings.html", {"settings": request.app.state.store.ai_settings(), "ai_configured": ai_config().configured})
+
+    @app.post("/ai-settings")
+    def save_ai_settings_route(request: Request, ai_enabled: str = Form("")):
+        request.app.state.store.save_ai_settings(ai_enabled.lower() in {"1", "true", "on"})
+        return RedirectResponse("/ai-settings", status_code=303)
+
+    @app.post("/jobs/{job_id}/ai-analyze")
+    def ai_analyze(request: Request, job_id: int, confirm_consent: str = Form("")):
+        store = request.app.state.store; job = store.get(job_id); profile = store.profile(); settings = store.ai_settings()
+        if not job: raise HTTPException(status_code=404, detail="岗位不存在")
+        if not (ai_config().configured and settings["ai_enabled"] and configured(dict(profile) if profile else None)):
+            return RedirectResponse("/jobs", status_code=303)
+        if deadline_state(job["deadline"]) == "expired" or job["match_score"] is None or job["match_score"] >= 80:
+            return RedirectResponse("/jobs", status_code=303)
+        if not settings["semantic_consented_at"] and confirm_consent.lower() not in {"1", "true", "on"}:
+            return RedirectResponse(f"/jobs?focus={job_id}&ai_consent={job_id}", status_code=303)
+        if not settings["semantic_consented_at"]: store.consent_ai("semantic")
+        payload = semantic_payload(dict(job), dict(profile))
+        key = fingerprint(payload, SEMANTIC_PROMPT_VERSION)
+        if store.cached_ai_analysis(job_id, key): return RedirectResponse(f"/jobs?focus={job_id}", status_code=303)
+        with request.app.state.ai_lock:
+            if job_id in request.app.state.ai_inflight: return RedirectResponse("/jobs", status_code=303)
+            request.app.state.ai_inflight.add(job_id)
+        try:
+            result = request.app.state.ai_client.analyze(payload)
+            store.save_ai_analysis(job_id, result, key)
+            store.mark_ai_used("semantic")
+        except AIUnavailable:
+            pass
+        finally:
+            with request.app.state.ai_lock: request.app.state.ai_inflight.discard(job_id)
+        return RedirectResponse(f"/jobs?focus={job_id}", status_code=303)
 
     @app.post("/jobs/{job_id}/favorite")
     def toggle_favorite(request: Request, job_id: int, next_url: str = Form("/jobs")):
@@ -637,11 +862,11 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
         return templates.TemplateResponse(request, "calendar.html" if view == "calendar" else "progress.html", context)
 
     @app.post("/progress/{app_id}/advance")
-    def advance_progress(request: Request, app_id: int, target_status: str = Form(""), event_type: str = Form(""), event_date: str = Form(""), description: str = Form("")):
-        if not valid_event_datetime(event_date):
+    def advance_progress(request: Request, app_id: int, target_status: str = Form(""), event_type: str = Form(""), event_date: str = Form(""), description: str = Form(""), scheduled_at: str = Form("")):
+        if not valid_event_datetime(event_date) or (scheduled_at and not valid_event_datetime(scheduled_at)):
             return RedirectResponse(url=f"/progress?focus={app_id}&message=请输入有效的事件日期", status_code=303)
         try:
-            target = request.app.state.store.advance_application(app_id, target_status, event_type, event_date, description)
+            target = request.app.state.store.advance_application(app_id, target_status, event_type, event_date, description, scheduled_at)
             app = request.app.state.store.application_by_id(app_id)
             job = request.app.state.store.get(app["job_id"]) if app else None
             message = f"已更新：{job['company']} · {job['title']} → {target}" if job else "申请进度已更新"
@@ -650,11 +875,11 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
         return RedirectResponse(url=f"/progress?focus={app_id}&message={message}", status_code=303)
 
     @app.post("/progress/{app_id}/events")
-    def add_progress_event(request: Request, app_id: int, event_type: str = Form(""), event_date: str = Form(""), description: str = Form("")):
-        if not valid_event_datetime(event_date):
+    def add_progress_event(request: Request, app_id: int, event_type: str = Form(""), event_date: str = Form(""), description: str = Form(""), scheduled_at: str = Form("")):
+        if not valid_event_datetime(event_date) or (scheduled_at and not valid_event_datetime(scheduled_at)):
             return RedirectResponse(url=f"/progress?focus={app_id}&message=请输入有效的事件日期", status_code=303)
         try:
-            request.app.state.store.add_application_event(app_id, event_type, event_date, description)
+            request.app.state.store.add_application_event(app_id, event_type, event_date, description, scheduled_at)
             message = "事件已添加"
         except ValueError as error:
             message = str(error)
