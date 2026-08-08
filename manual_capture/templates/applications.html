@@ -15,6 +15,7 @@
       <a class="active" href="/applications">投递工作台</a>
       <a href="/progress">申请进度</a>
       <a href="/profile">求职画像</a>
+      <a href="/ai-settings">AI 设置</a>
     </nav>
   </header>
   <main>
@@ -85,6 +86,7 @@
       <button type="button" class="dialog-close" onclick="this.closest('dialog').close()">关闭</button>
       <h2>手动记录已投递</h2>
       <p>用于在 BOSS、官网或其他渠道已经完成投递的岗位。</p>
+      {% if manual_event %}<div class="alert warning">此操作会手动创建一条“已投递”申请，并明确关联邮件《{{ manual_event.subject }}》。若邮件已有“笔试/面试/Offer/拒信”分类，保存即表示你确认该分类，会同步更新这份新申请的阶段；解析失败邮件则只建立关联，不推断阶段。</div><input type="hidden" name="email_event_id" value="{{ manual_event.id }}">{% endif %}
       <label>公司名 *<input name="company" required></label>
       <label>岗位名 *<input name="title" required></label>
       <label>工作地点 *<input name="city" required></label>
@@ -92,8 +94,9 @@
         <select name="source"><option>其他</option><option>官网</option><option>BOSS直聘</option><option>牛客</option><option>公众号</option></select>
       </label>
       <label>投递链接<input name="application_url" type="url"></label>
-      <button type="submit">保存为已投递</button>
+      <button type="submit">{% if manual_event %}保存并关联此邮件{% else %}保存为已投递{% endif %}</button>
     </form>
   </dialog>
 </body>
 </html>
+{% if manual_event %}<script>window.addEventListener('DOMContentLoaded',function(){document.getElementById('manual').showModal()})</script>{% endif %}
