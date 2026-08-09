@@ -1,0 +1,23 @@
+<dialog id="manual-email-{{ event.id }}" class="email-manual-dialog">
+  <form method="post" action="/applications/manual" class="dialog-form">
+    <button type="button" class="dialog-close" onclick="this.closest('dialog').close()">关闭</button>
+    <h2>从邮件补记申请</h2>
+    <p>以下信息来自邮件解析，可直接修改；保存即由你确认关联与阶段，不会自动写入岗位投递 DDL。</p>
+    <input type="hidden" name="email_event_id" value="{{ event.id }}">
+    <input type="hidden" name="return_to" value="email">
+    <label>公司名称 *<input name="company" value="{{ event.extracted_company or '' }}" required></label>
+    <label>岗位名称 *<input name="title" value="{{ event.extracted_title or '' }}" required></label>
+    <label>工作地点 *<input name="city" value="{{ event.extracted_city or '' }}" required></label>
+    <label>当前状态 *<select name="event_category" required>
+      <option value="笔试" {% if event.category == '笔试' %}selected{% endif %}>测评／笔试</option>
+      <option value="面试" {% if event.category == '面试' %}selected{% endif %}>面试</option>
+      <option value="Offer" {% if event.category == 'Offer' %}selected{% endif %}>Offer</option>
+      <option value="拒信" {% if event.category == '拒信' %}selected{% endif %}>拒信／已结束</option>
+    </select></label>
+    <label>测评／笔试开始或面试安排时间（可改）<input type="datetime-local" name="scheduled_at" value="{{ event.proposed_scheduled_at or '' }}"></label>
+    <label>当前节点行动截止（可改）<input type="datetime-local" name="action_deadline_at" value="{{ event.proposed_action_deadline_at or '' }}"></label>
+    <label>来源<select name="source"><option>其他</option><option>官网</option><option>BOSS直聘</option><option>牛客</option><option>公众号</option></select></label>
+    <label>投递链接<input name="application_url" type="url"></label>
+    <button type="submit">保存申请并关联邮件</button>
+  </form>
+</dialog>

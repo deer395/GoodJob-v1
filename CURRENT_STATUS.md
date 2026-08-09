@@ -1,142 +1,48 @@
 # CURRENT_STATUS
 
-## 本轮最新状态（2026-08-06，优先于以下历史交接描述）
+## 本轮最新状态（2026-08-10，优先于以下历史交接描述）
 
-- 用户已明确授权并确认 Phase 2 第一批修订版的全部 8 项修订；任务 1（本地 CSV/XLSX 导入）和任务 2（ICS 日历导出）已实现。
-- 新增 `import_batches`、`job_postings.source_import_id` 和 `application_events.scheduled_at`；Alembic 已升级至 `20260806_phase2_import_calendar (head)`。
-- 导入保持本地处理、批次可追溯和受保护覆盖；ICS 仅为用户下载后自行导入的文件，不含外部同步或提醒。
-- 自动化测试最新结果为 `23 passed`（使用工作区 `.pytest_tmp`，规避系统临时目录访问限制）。仍不创建 Git 提交，并保留 20 条模拟数据与原数据库备份。
-- 已针对真实 XLSX 修复导入识别：重置错误的已用区域元数据、自动选择数据行最多的工作表，并在前 20 行寻找实际表头，跳过说明/空白前置行；单个文件上限已按真实 659 行校招表调整为最多 1000 条数据行。缺少公司、岗位或城市的行默认跳过并汇总提示。
-- 最新验证：自动化测试 `26 passed`；对用户提供的真实 XLSX 在隔离测试数据库完成全流程上传、预览、确认导入，结果为 659 行中新增 658 条、跳过 1 条（缺少岗位名称），未写入用户的实际岗位池或改动原始文件。
-- 紧急修复：已检索确认无 `compny` 拼写；ICS 仅导出有 `scheduled_at` 的真实测评/面试安排，排除通知、已投递事件、已结束申请及已投递岗位 DDL。最新自动化测试为 `27 passed`。
+- Phase 2 第四批第一阶段（邮件自动关联状态安全、岗位删除数据完整性、全量导出与恢复、Alembic 迁移与备份基线）已正式验收。
+- Phase 2 第四批第二阶段（核心可用性 P1 整改）已验收：雷达快捷筛选、岗位长标题与操作区布局、邮件同步诊断均已完成。
+- 完整自动化回归已执行：`D:\ANACONDA\python.exe -m pytest manual_capture/tests -q --basetemp=D:\CODEX\LLMcampus\pytest_phase2_fourth_batch_recheck`，结果为 `60 passed, 1 warning`（Starlette `TestClient` 弃用警告）。
+- 当前工作区仍有用户已有的未提交改动；本轮未创建 Git 提交。
 
 ## 1. 当前阶段
 
-- 当前正在进行的工作：Phase 1 四个闭环完成后的交接与文档整理；尚未启动下一阶段功能开发。
-- 当前阶段目标：形成可由新对话直接接手的项目主文档与即时状态文档，并保留已确认可用的本地演示数据集。
-- 当前阶段起点：闭环 4 的申请进度、时间线、漏斗和本地日历视图已实现并验证。
-- 当前阶段结束条件：交接文档经用户确认，且用户明确授权下一阶段的具体范围后才开始新增功能。
+- 当前交付状态：Phase 2 已完成至第四批第二阶段，等待用户确定下一轮范围。
+- 已验收范围不包括第四批第三阶段；AI 匹配策略升级和邮件解析策略升级均尚未开始。
+- 新增能力必须先更新并获得对应决策卡确认，且不得突破本地、人工确认和用户最终投递权边界。
 
 ## 2. 当前有效状态
 
-- GoodJobAI 的闭环 1—4 已实现：手动收录岗位、秋招雷达、投递工作台、申请进度与本地日历视图。
-- 闭环 4 包含 Application 状态流转、ApplicationEvent 时间线、下一步行动及计划时间、漏斗和列表/日历视图。
-- 列表与日历视图使用统一的 Tab 模板片段，已解决两页 Tab 样式不一致和静态 CSS 缓存导致的默认 HTML 样式问题。
-- 本地数据库当前已清空原岗位及关联申请记录，并写入 20 条中文模拟校招岗位；求职画像被保留。用户已确认该模拟数据结果没有问题，数据应继续保留。
-- 原数据库在清空前已备份为 `manual_capture/backups/before-demo-seed-20260806-150359.db`。
-- 数据库迁移版本已明确验证到 `20260806_progress (head)`。
-- 已运行的自动化测试最近一次结果为 `20 passed`；该结果覆盖闭环 1—4 和日历数据投影测试。
-- 用户要求暂不创建新的 Git 提交；当前工作区存在未提交变更，后续不得擅自提交。
+- GoodJobAI 已具备手动收录、秋招雷达、投递工作台、申请进度、表格/日历/邮件待确认视图，以及本地 CSV/XLSX 导入和用户触发的 ICS 导出。
+- 雷达页提供临期、今日新增、本周截止、收藏、高匹配、待评估六个互斥快捷筛选；搜索词与筛选条件按 AND 组合，页面显示当前条件、结果数和一键清除入口。未配置画像时，高匹配入口不可用。
+- 岗位卡的公司名与岗位名在桌面和窄屏均最多两行截断；“查看详情”等主操作保持独立可点击，完整标题仍在详情内可见。
+- 邮件同步为用户主动触发的本地只读单次操作，固定扫描 INBOX 近 7 天、最多 50 封。页面显示进行中状态、候选/新增/去重计数；结构化计数不可用时明确显示“不可用”，不以 0 替代。
+- 邮件同步失败使用不含敏感信息的诊断类别，并提供重试和 `/email-sync-help` 配置说明入口；Agent 启动异常会安全降级，不返回未处理的 500 错误。
+- 邮件关联状态机、自动关联收紧规则和邮件解析策略未因第二阶段而改变；AI 匹配与邮件解析升级仍为后续方案。
 
-## 3. 当前正在处理的问题
+## 3. 当前待处理事项
 
-### 交接文档完成度
-
-- 问题：新对话需要同时掌握长期规则和即时状态。
-- 已知事实：`PROJECT_MASTER.md` 已创建并按修复清单调整；本文件用于补充当前即时状态。
-- 未解决内容：等待用户确认交接文档是否足以开始下一阶段。
-- 阻断条件：在下一阶段范围未获明确授权前，不开始新功能实现。
-
-### 下一阶段范围
-
-- 问题：下一阶段尚未收到具体的功能说明或授权文本。
-- 已知事实：Excel/CSV 导入明确不属于 Phase 1，统一留待 Phase 2；20 条模拟数据应保留。
-- 未解决内容：除导入范围外，下一阶段的功能目标和边界待用户提供。
-- 阻断条件：未获具体授权前，不开始新功能实现。
+- 等待用户确认下一轮产品目标与范围；在新范围确认前，不进入第四批第三阶段。
+- 如需进行本机运行验收，应由拥有 `manual_capture/campusai_manual.db` 文件权限的本地终端启动应用，并按既有恢复/迁移说明完成启动检查；本文件不将该运行环境操作记为已完成事实。
 
 ## 4. 当前材料与信息来源
 
 - 长期项目背景与边界：[PROJECT_MASTER.md](PROJECT_MASTER.md)。
 - 全局工程与产品规则：[AGENTS.md](AGENTS.md)。
-- 即时状态文档：本文件 `CURRENT_STATUS.md`。
 - 产品决策记录：[docs/decision-log.md](docs/decision-log.md)。
-- 闭环 4 决策卡：[docs/decisions/loop-4-application-progress.md](docs/decisions/loop-4-application-progress.md)。
-- 主应用与数据访问：[manual_capture/app.py](manual_capture/app.py)。
-- 申请进度列表模板：[manual_capture/templates/progress.html](manual_capture/templates/progress.html)。
-- 申请进度日历模板：[manual_capture/templates/calendar.html](manual_capture/templates/calendar.html)。
-- 列表/日历共享 Tab 模板：[manual_capture/templates/_progress_view_tabs.html](manual_capture/templates/_progress_view_tabs.html)。
-- 样式文件：[manual_capture/static/app.css](manual_capture/static/app.css)。
-- 自动化测试：[manual_capture/tests/test_manual_capture.py](manual_capture/tests/test_manual_capture.py)。
-- 当前 SQLite 数据库：`manual_capture/campusai_manual.db`。
-- 最近闭环 4 Alembic 迁移：[alembic/versions/20260806_application_progress.py](alembic/versions/20260806_application_progress.py)。
-- 原始数据备份：`manual_capture/backups/before-demo-seed-20260806-150359.db`。
+- 第四批决策卡：[docs/decisions/phase-2-fourth-batch-data-safety-usability.md](docs/decisions/phase-2-fourth-batch-data-safety-usability.md)。
+- 主应用与测试：[manual_capture/app.py](manual_capture/app.py)、[manual_capture/tests](manual_capture/tests)。
 
-## 5. 当前采用的方案
-
-- 申请进度使用 Application 与 ApplicationEvent 建模，岗位与申请流程状态分离。
-- 申请进度默认列表视图展示漏斗、阶段筛选、卡片和时间线；日历视图只投影既有事件、岗位 DDL 与 `next_action_due_at`。
-- 日历颜色约定：DDL 为绿色、面试为蓝色、测评/笔试为黄色、已投递为灰色、下一步计划为红色。
-- 列表与日历视图的切换器必须继续使用共享模板 `_progress_view_tabs.html`，并使用相同 CSS 版本参数，避免再次分支漂移或缓存不一致。
-- 不得修改的部分：已确认的 Application 状态、事件补建规则、漏斗“曾到达阶段”口径、最终投递权归用户。
-- 暂定部分：下一阶段的具体范围和是否启动 Phase 2，待用户决定；模拟数据已确认保留。
-
-## 6. 最近完成的关键工作
-
-- 实现并验证申请进度的时间线、推进阶段、添加事件、撤回、结束、漏斗和本地日历视图。
-- 修复时间线展示为最近 3 条优先、完整时间线可展开、事件数量可见、时间格式友好。
-- 修复列表/日历 Tab 的 CSS 缓存和样式不一致问题，实际截图验证两视图均显示按钮样式。
-- 创建 `PROJECT_MASTER.md`，并按 `docs/Codex指令_修复PROJECT_MASTER.md` 完成 1→7 项修正。
-- 备份原本地数据库后，写入 20 条中文模拟岗位用于人工验收。
-
-## 7. 待完成事项
-
-### 阻断项
-
-- 用户明确授权下一阶段的具体功能范围。验收条件：用户给出清晰、可执行的阶段目标与边界。
-
-### 必须完成项
-
-- 确认交接文档。验收条件：用户确认 `PROJECT_MASTER.md` 与 `CURRENT_STATUS.md` 可作为新对话接手材料，或给出需修正项。
-
-### 可延后项
-
-- 是否将当前未提交改动创建 Git 提交。验收条件：仅在用户明确要求提交后执行。
-
-## 8. 当前未决问题
-
-### 缺少材料
-
-- 下一阶段的功能说明或授权文本：待用户提供。
-
-### 缺少验证
-
-- 无已确认的当前缺少验证项。
-
-### 存在方案冲突
-
-- 无。Excel/CSV 导入已明确归入 Phase 2。
-
-### 需要用户决策
-
-- 下一阶段是否启动，以及启动的功能边界。
-- 何时创建 Git 提交。
-
-### 需要外部信息核实
-
-- 无。
-
-## 9. 当前风险与限制
-
-- 当前 SQLite 数据已被演示数据替换；恢复真实数据需要显式使用已创建的备份，不能默认覆盖模拟数据。
-- 工作区包含未提交变更；用户已明确要求暂不提交，后续操作应避免混入无关改动。
-- 本地服务地址和运行进程属于易变运行态；新对话开始时必须重新检查，不能假设仍在运行。
-
-## 10. 下一次新对话的启动指令
+## 5. 下一次新对话的启动指令
 
 ```text
-在 D:\CODEX\LLMcampus 接手 GoodJobAI。先完整阅读 AGENTS.md、PROJECT_MASTER.md、CURRENT_STATUS.md，并执行 git status。当前处于 Phase 1 完成后的交接阶段，未获得下一阶段具体授权前不得新增功能或提交 Git。保留现有 20 条模拟岗位和数据库备份，不要覆盖数据。先询问或读取用户提供的下一阶段范围；若用户要求继续实现，先核对相关决策卡、代码、迁移和测试，再按确认范围执行。
+在 D:\CODEX\LLMcampus 接手 GoodJobAI。先完整阅读 AGENTS.md、PROJECT_MASTER.md、CURRENT_STATUS.md、docs/decision-log.md 和当前决策卡，并执行 git status。当前已验收至 Phase 2 第四批第二阶段；不得进入第三阶段的 AI 匹配或邮件解析策略升级，除非用户先确认新的决策卡。保留本地、人工确认和最终投递权边界；不要擅自提交 Git。
 ```
 
-## 11. 最后更新时间与更新依据
+## 6. 更新依据
 
-- 更新时间：2026-08-06。
-- 本状态基于本长对话截至当前的最新用户确认、已执行的实现与验证结果生成。
-- 未能确认的下一阶段范围已明确标为待确认；模拟数据保留与导入归属已确认。
-
-## 下次更新时应删除或替换的易过期信息
-
-- 当前阶段为“交接与文档整理”的描述。
-- 当前模拟数据数量、数据库备份路径。
-- 最近测试结果、数据库迁移版本和本地服务运行状态。
-- 未提交变更与“暂不提交 Git”的用户指令。
-- 下一阶段授权及所有待确认项。
+- 更新时间：2026-08-10。
+- 本状态基于本轮已确认的第四批第一、二阶段验收结论及实际执行的完整自动化回归结果生成。
+- 本文件不记录易变的服务端口、进程状态或未确认的运行环境结论。

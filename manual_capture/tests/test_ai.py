@@ -42,15 +42,15 @@ def test_schema_rejects_invalid_semantic_score():
 
 def test_email_parser_uses_ascii_wire_category(monkeypatch):
     client = OpenAIClient()
-    monkeypatch.setattr(client, "_call", lambda *_: {"category": "exam", "company": "示例公司", "title": None, "scheduled_date": None, "summary": "请在指定时间内完成在线测评并注意浏览器兼容性", "confidence": 88.4})
+    monkeypatch.setattr(client, "_call", lambda *_: {"category": "exam", "company": "示例公司", "title": None, "scheduled_date": None, "action_deadline": "2026-08-12T20:00", "summary": "请在指定时间内完成在线测评并注意浏览器兼容性", "confidence": 88.4})
     parsed = client.parse_email({"subject": "测评邀请", "sender_domain": "example.com", "snippet": "请完成测评"})
-    assert parsed.category == "笔试" and parsed.confidence == 88 and parsed.scheduled_date == "" and len(parsed.summary) <= 30
+    assert parsed.category == "笔试" and parsed.confidence == 88 and parsed.scheduled_date == "" and parsed.action_deadline == "2026-08-12T20:00" and len(parsed.summary) <= 30
 
 
 def test_email_sync_button_runs_one_local_agent_once(tmp_path, monkeypatch):
     import subprocess
     import manual_capture.app as app_module
-    monkeypatch.setattr(app_module.subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "candidate emails: 2; dry-run=False\n", ""))
+    monkeypatch.setattr(app_module.subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, 'candidate emails: 2; dry-run=False\nsync-diagnostics: {"candidate_count": 2, "created_count": 1, "deduplicated_count": 1}\n', ""))
     client = TestClient(create_app(tmp_path / "sync.db"))
     response = client.post("/api/email-sync", follow_redirects=True)
     assert response.status_code == 200
@@ -66,6 +66,29 @@ def test_email_can_be_manually_recorded_and_explicitly_linked(tmp_path):
     assert "已手动记录投递并关联邮件" in response.text
     assert store.application_by_id(1)["status"] == "测评/笔试"
     assert store.email_event(1)["status"] == "confirmed"
+
+
+def test_manual_email_application_prefills_fields_confirms_time_and_returns_to_email(tmp_path):
+    app = create_app(tmp_path / "manual-prefill.db")
+    store = app.state.store
+    store.insert_email_event({"dedup_key": "test:manual-prefill", "subject": "星河科技测评", "snippet": "岗位：数据产品经理，工作地：上海", "received_at": "2026-08-09T10:00:00", "category": "笔试", "summary": "测评通知", "confidence": 45, "company": "星河科技", "title": "数据产品经理", "city": "上海", "proposed_action_deadline_at": "2026-08-12T20:00"})
+    client = TestClient(app)
+    form = client.get("/applications?manual_event=1")
+    assert 'value="星河科技"' in form.text and 'value="数据产品经理"' in form.text and 'value="上海"' in form.text
+    response = client.post("/applications/manual", data={"company": "星河科技", "title": "数据产品经理", "city": "上海", "source": "其他", "email_event_id": 1, "confirm_action_deadline": "true", "return_to": "email"}, follow_redirects=False)
+    assert response.headers["location"].startswith("/progress?view=email")
+    linked = next(event for event in store.application_events(1) if event["event_type"] == "笔试通知")
+    assert linked["action_deadline_at"] == "2026-08-12T20:00"
+
+
+def test_email_page_opens_editable_manual_dialog_without_workspace_navigation(tmp_path):
+    app = create_app(tmp_path / "email-dialog.db")
+    store = app.state.store
+    store.insert_email_event({"dedup_key": "test:email-dialog", "subject": "星河科技测评", "snippet": "岗位：数据产品经理，工作地：上海", "received_at": "2026-08-09T10:00:00", "category": "笔试", "summary": "测评通知", "confidence": 45, "company": "星河科技", "title": "数据产品经理", "city": "上海", "proposed_action_deadline_at": "2026-08-12T20:00"})
+    page = TestClient(app).get("/progress?view=email")
+    assert 'id="manual-email-1"' in page.text
+    assert 'name="event_category"' in page.text and 'name="action_deadline_at"' in page.text
+    assert 'value="星河科技"' in page.text and 'value="数据产品经理"' in page.text and 'value="上海"' in page.text
 
 
 def test_empty_email_association_returns_guidance_instead_of_server_error(tmp_path):
@@ -88,6 +111,39 @@ def test_auto_email_link_requires_high_confidence_and_exact_unique_job(tmp_path)
     assert should_auto_apply_email({**payload, "category": "其他"}, store) is None
 
 
+def test_email_link_never_reopens_ended_application_or_duplicates_one_email_event(tmp_path):
+    app = create_app(tmp_path / "email-state-safety.db")
+    store = app.state.store
+    job_id = store.create({"company": "状态公司", "title": "产品经理", "city": "北京", "source": "其他", "application_url": "", "salary_range": "", "department": "", "description_text": "", "deadline": "", "note": ""})
+    app_id = store.create_application(job_id)
+    assert store.confirm_application(app_id)
+    store.advance_application(app_id, "已结束", "拒信", "2026-08-09")
+    payload = {"category": "笔试", "confidence": 95, "company": "状态公司", "title": "产品经理"}
+    assert should_auto_apply_email(payload, store) is None
+    store.insert_email_event({"dedup_key": "test:ended", "subject": "笔试", "snippet": "通知", "received_at": "2026-08-09T10:00:00", **payload})
+    try:
+        store.resolve_email_event(1, "confirmed", app_id)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("ended application must not be advanced")
+    assert store.application_by_id(app_id)["status"] == "已结束"
+    assert store.email_event(1)["status"] == "pending"
+
+    active_job = store.create({"company": "幂等公司", "title": "算法工程师", "city": "上海", "source": "其他", "application_url": "", "salary_range": "", "department": "", "description_text": "", "deadline": "", "note": ""})
+    active_id = store.create_application(active_job)
+    assert store.confirm_application(active_id)
+    store.insert_email_event({"dedup_key": "test:idempotent", "subject": "笔试", "snippet": "通知", "received_at": "2026-08-09T10:00:00", "category": "笔试", "confidence": 95, "company": "幂等公司", "title": "算法工程师"})
+    store.resolve_email_event(2, "confirmed", active_id)
+    try:
+        store.resolve_email_event(2, "confirmed", active_id)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("one EmailEvent must create at most one application event")
+    assert len(store.application_events(active_id)) == 2
+
+
 def test_email_event_stores_parser_version_and_progress_renders_email_view(tmp_path):
     app = create_app(tmp_path / "email-view.db")
     store = app.state.store
@@ -96,6 +152,22 @@ def test_email_event_stores_parser_version_and_progress_renders_email_view(tmp_p
     page = TestClient(app).get("/progress?view=email")
     assert page.status_code == 200
     assert "同步邮箱" in page.text and "email-pending-queue" not in page.text
+
+
+def test_pending_email_can_be_reparsed_to_fill_key_time(tmp_path):
+    app = create_app(tmp_path / "reparse-pending.db")
+    app.state.store.save_ai_settings(False, email_enabled=True)
+    app.state.store.insert_email_event({"dedup_key": "test:reparse-pending", "subject": "在线测评", "snippet": "请完成", "received_at": "2026-08-09T10:00:00", "category": "笔试", "summary": "测评", "confidence": 45})
+
+    class Fake:
+        def parse_email(self, _):
+            from manual_capture.email_processing import EmailParse
+            return EmailParse(category="笔试", summary="测评截止", confidence=80, action_deadline="2026-08-12T20:00")
+
+    app.state.ai_client = Fake()
+    response = TestClient(app).post("/api/pending-events/1/reparse", follow_redirects=True)
+    assert response.status_code == 200
+    assert app.state.store.email_event(1)["proposed_action_deadline_at"] == "2026-08-12T20:00"
 
 
 def test_primary_pages_expose_ai_settings_navigation(tmp_path):

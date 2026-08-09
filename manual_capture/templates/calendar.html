@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GoodJobAI · 申请进度日历</title><link rel="stylesheet" href="{{ url_for('static', path='app.css') }}?v=progress-20260806"></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GoodJobAI · 申请进度日历</title><link rel="stylesheet" href="{{ url_for('static', path='app.css') }}?v=email-manual-20260809-1"></head>
 <body>
 <header><div class="brand">GoodJobAI</div><nav><a href="/">手动收录岗位</a><a href="/jobs">秋招雷达</a><a href="/applications">投递工作台</a><a class="active" href="/progress">申请进度</a><a href="/profile">求职画像</a><a href="/ai-settings">AI 设置</a></nav></header>
 <main>
@@ -8,7 +8,7 @@
   {% include "_progress_view_tabs.html" %}
   <section class="calendar-card">
     <div class="calendar-head"><a class="secondary-link" href="/progress?view=calendar&year={{ previous_month.year }}&month={{ previous_month.month }}">上一月</a><h2>{{ calendar_year }} 年 {{ calendar_month }} 月</h2><a class="secondary-link" href="/progress?view=calendar&year={{ following_month.year }}&month={{ following_month.month }}">下一月</a></div>
-    <div class="calendar-legend"><span class="calendar-dot deadline-dot"></span>DDL <span class="calendar-dot interview-dot"></span>面试 <span class="calendar-dot assessment-dot"></span>测评/笔试 <span class="calendar-dot applied-dot"></span>已投递 <span class="calendar-dot next-action-dot"></span>下一步计划</div>
+    <div class="calendar-legend"><span class="calendar-dot deadline-dot"></span>投递 DDL <span class="calendar-dot interview-dot"></span>面试/安排 <span class="calendar-dot assessment-dot"></span>测评/笔试 <span class="calendar-dot applied-dot"></span>已投递 <span class="calendar-dot next-action-dot"></span>行动截止/下一步</div>
     <div class="calendar-weekdays"><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span></div>
     <div class="calendar-grid">
       {% for cell in calendar_cells %}

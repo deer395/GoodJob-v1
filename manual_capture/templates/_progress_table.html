@@ -1,0 +1,47 @@
+<section class="table-view" aria-label="申请进度表格视图">
+  <div class="section-title">
+    <div>
+      <h2>表格视图</h2>
+      <span>每行一份申请；点击行查看完整卡片与操作。</span>
+    </div>
+    <div class="table-sort" aria-label="表格排序">
+      <a class="{% if table_sort == 'priority' %}selected{% endif %}" href="/progress?view=table&table_sort=priority">阶段优先</a>
+      <a class="{% if table_sort == 'deadline' %}selected{% endif %}" href="/progress?view=table&table_sort=deadline">DDL</a>
+      <a class="{% if table_sort == 'applied' %}selected{% endif %}" href="/progress?view=table&table_sort=applied">投递时间</a>
+    </div>
+  </div>
+
+  <div class="progress-table-wrap">
+    <table class="progress-table">
+      <colgroup><col class="col-company"><col class="col-title"><col class="col-city"><col class="col-applied"><col class="col-stage"><col class="col-current-time"><col class="col-actions"></colgroup>
+      <thead><tr><th>公司</th><th>岗位</th><th>城市</th><th>投递日期</th><th>阶段</th><th>当前节点截止／安排</th><th>操作</th></tr></thead>
+      <tbody>
+      {% for application in table_applications %}
+        <tr class="{% if application.status == '已结束' %}table-ended{% endif %} {% if deadline_state(application.deadline) %}table-{{ deadline_state(application.deadline) }}{% endif %}" data-row-href="/progress?view=list&focus={{ application.id }}" tabindex="0">
+          <td title="{{ application.company }}">{{ application.company|truncate(18, true, '…') }}</td>
+          <td title="{{ application.title }}">{{ application.title|truncate(22, true, '…') }}</td>
+          <td><span class="{% if city_summary(application.city) != application.city %}city-summary{% endif %}" title="{{ application.city }}">{{ city_summary(application.city) }}</span></td>
+          <td>{% if application.applied_at %}{{ friendly_datetime(application.applied_at)[:5] }}{% else %}—{% endif %}</td>
+          <td class="table-stage"><span class="stage-badge">{{ application.status }}</span><div class="stage-progress" title="{{ stage_progress(application.status) }}/4"><span style="width: {{ stage_progress(application.status) * 25 }}%"></span></div></td>
+          <td class="next-milestone-cell {% if table_timings[application.id].value and table_deadline_class(table_timings[application.id].value[:10]) == 'expired' %}overdue{% endif %}">{% if table_timings[application.id].value %}<strong>{{ table_timings[application.id].label }}</strong><small>{{ friendly_datetime(table_timings[application.id].value) }}</small>{% else %}—{% endif %}</td>
+          <td><details class="table-action-menu"><summary aria-label="查看操作">⋯</summary><a href="/progress?view=list&focus={{ application.id }}">查看与操作</a></details></td>
+        </tr>
+      {% else %}
+        <tr><td colspan="7" class="table-empty">暂无可追踪的申请。</td></tr>
+      {% endfor %}
+      </tbody>
+      <tfoot><tr><td colspan="5">合计 {{ table_summary.total }} 份申请</td><td>按当前阶段展示</td><td></td></tr></tfoot>
+    </table>
+  </div>
+
+  <div class="progress-table-mobile">
+  {% for application in table_applications %}
+    <a class="table-mobile-card {% if application.status == '已结束' %}table-ended{% endif %}" href="/progress?view=list&focus={{ application.id }}">
+      <strong>{{ application.company }} · {{ application.title }}</strong>
+      <span><b>{{ application.status }}</b> · {% if table_timings[application.id].value %}{{ table_timings[application.id].label }}：{{ friendly_datetime(table_timings[application.id].value) }}{% else %}当前节点未记录时间{% endif %}</span>
+    </a>
+  {% else %}
+    <div class="empty">暂无可追踪的申请。</div>
+  {% endfor %}
+  </div>
+</section>

@@ -7,13 +7,18 @@ import re
 import subprocess
 import sys
 import threading
+import shutil
+import tempfile
+from threading import RLock
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterator
 
-from fastapi import FastAPI, Form, HTTPException, Request
-from fastapi.responses import RedirectResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from alembic import command
+from alembic.config import Config
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from .matching import canonical_tags, configured, evaluate
@@ -24,6 +29,7 @@ from .email_processing import PARSER_VERSION, local_email_parse
 import os, secrets
 
 BASE_DIR = Path(__file__).resolve().parent
+APP_VERSION = "phase-2-fourth-batch-v1"
 SOURCES = ("官网", "BOSS直聘", "牛客", "公众号", "其他")
 APPLICATION_STATUSES = ("待投递", "已投递", "测评/笔试", "面试", "Offer", "已结束")
 PROGRESS_STATUSES = APPLICATION_STATUSES[1:]
@@ -46,23 +52,93 @@ ADVANCE_TARGETS = {
 class JobStore:
     def __init__(self, db_path: Path | str):
         self.db_path = str(db_path)
+        self._database_lock = RLock()
+        self._restart_marker = Path(self.db_path).with_suffix(".restore-pending.json")
         self.initialize()
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.db_path)
-        connection.row_factory = sqlite3.Row
-        try:
-            yield connection
-        except Exception:
-            connection.rollback()
-            raise
-        else:
-            connection.commit()
-        finally:
-            connection.close()
+        with self._database_lock:
+            connection = sqlite3.connect(self.db_path)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            try:
+                yield connection
+            except Exception:
+                connection.rollback()
+                raise
+            else:
+                connection.commit()
+            finally:
+                connection.close()
 
     def initialize(self) -> None:
+        """Upgrade through Alembic, then verify rather than mutating schema at runtime."""
+        config = Config(str(BASE_DIR.parent / "alembic.ini"))
+        config.set_main_option("script_location", str(BASE_DIR.parent / "alembic"))
+        config.set_main_option("sqlalchemy.url", f"sqlite:///{Path(self.db_path).resolve().as_posix()}")
+        self._backup_before_migration_if_needed(config)
+        command.upgrade(config, "head")
+        self._verify_schema()
+        with self.connection() as conn:
+            self._backfill_applied_events(conn)
+        self._complete_pending_restart_check()
+
+    def _backup_before_migration_if_needed(self, config: Config) -> None:
+        db = Path(self.db_path)
+        if not db.exists() or db.stat().st_size == 0:
+            return
+        try:
+            with sqlite3.connect(db) as conn:
+                row = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='alembic_version'").fetchone()
+                current = conn.execute("SELECT version_num FROM alembic_version").fetchone()[0] if row else None
+        except sqlite3.Error:
+            current = None
+        from alembic.script import ScriptDirectory
+        if current == ScriptDirectory.from_config(config).get_current_head():
+            return
+        backup_dir = db.parent / "backups"
+        backup_dir.mkdir(exist_ok=True)
+        shutil.copy2(db, backup_dir / f"before-migration-{datetime.now():%Y%m%d-%H%M%S}.db")
+
+    def _complete_pending_restart_check(self) -> None:
+        """Only a fresh application start may mark a replacement restore healthy."""
+        if not self._restart_marker.exists():
+            return
+        try:
+            marker = json.loads(self._restart_marker.read_text(encoding="utf-8"))
+            self.health_check()
+            marker["restart_checked_at"] = datetime.now().isoformat(timespec="seconds")
+            marker["status"] = "restart_health_check_passed"
+            self._restart_marker.with_suffix(".restore-verified.json").write_text(json.dumps(marker, ensure_ascii=False), encoding="utf-8")
+            self._restart_marker.unlink()
+        except Exception:
+            # Keep the pending marker: the startup must not report recovery success.
+            raise RuntimeError("恢复后的启动健康检查未通过；请从恢复前备份回滚")
+
+    def _verify_schema(self) -> None:
+        required = {
+            "job_postings", "candidate_profiles", "applications", "checklist_items",
+            "application_events", "import_batches", "ai_settings", "email_dedup",
+            "email_events", "email_event_links", "email_sync_diagnostics", "job_ai_analyses", "alembic_version",
+        }
+        with self.connection() as conn:
+            tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            missing = required - tables
+            if missing:
+                raise RuntimeError("数据库迁移未完成：" + ", ".join(sorted(missing)))
+
+    def health_check(self) -> None:
+        self._verify_schema()
+        with self.connection() as conn:
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise RuntimeError("数据库关联完整性检查失败")
+
+    def legacy_initialize(self) -> None:
+        """Temporary reference for historic databases; no longer called by the application."""
+        if not hasattr(self, "_database_lock"):
+            self._database_lock = RLock()
         with self.connection() as conn:
             conn.execute(
                 """
@@ -102,7 +178,7 @@ class JobStore:
             conn.execute("""CREATE TABLE IF NOT EXISTS application_events (
                 id INTEGER PRIMARY KEY, application_id INTEGER NOT NULL,
                 event_type TEXT NOT NULL, event_date TEXT NOT NULL,
-                scheduled_at TEXT, description TEXT, created_at TEXT NOT NULL,
+                scheduled_at TEXT, action_deadline_at TEXT, description TEXT, created_at TEXT NOT NULL,
                 FOREIGN KEY(application_id) REFERENCES applications(id)
             )""")
             job_columns = {row["name"] for row in conn.execute("PRAGMA table_info(job_postings)").fetchall()}
@@ -111,6 +187,8 @@ class JobStore:
             event_columns = {row["name"] for row in conn.execute("PRAGMA table_info(application_events)").fetchall()}
             if "scheduled_at" not in event_columns:
                 conn.execute("ALTER TABLE application_events ADD COLUMN scheduled_at TEXT")
+            if "action_deadline_at" not in event_columns:
+                conn.execute("ALTER TABLE application_events ADD COLUMN action_deadline_at TEXT")
             conn.execute("""CREATE TABLE IF NOT EXISTS import_batches (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, filename TEXT NOT NULL, imported_at TEXT NOT NULL,
                 total_rows INTEGER NOT NULL, created_count INTEGER NOT NULL DEFAULT 0,
@@ -124,11 +202,12 @@ class JobStore:
                     conn.execute(f"ALTER TABLE ai_settings ADD COLUMN {column} TEXT")
             if "enable_email_parsing" not in setting_columns: conn.execute("ALTER TABLE ai_settings ADD COLUMN enable_email_parsing INTEGER NOT NULL DEFAULT 0")
             conn.execute("""CREATE TABLE IF NOT EXISTS email_dedup (id INTEGER PRIMARY KEY, dedup_key TEXT NOT NULL UNIQUE,key_type TEXT NOT NULL,mailbox TEXT NOT NULL DEFAULT 'INBOX',uid TEXT,uid_validity TEXT,message_id TEXT,content_hash TEXT,action TEXT NOT NULL,processed_at TEXT NOT NULL)""")
-            conn.execute("""CREATE TABLE IF NOT EXISTS email_events (id INTEGER PRIMARY KEY,dedup_key TEXT NOT NULL UNIQUE,message_id TEXT,sender_domain TEXT,subject TEXT NOT NULL,snippet TEXT NOT NULL,received_at TEXT NOT NULL,category TEXT,summary TEXT,confidence REAL,extracted_company TEXT,extracted_title TEXT,proposed_application_id INTEGER,proposed_scheduled_at TEXT,status TEXT NOT NULL DEFAULT 'pending',linked_application_event_id INTEGER,parser_version TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS email_events (id INTEGER PRIMARY KEY,dedup_key TEXT NOT NULL UNIQUE,message_id TEXT,sender_domain TEXT,subject TEXT NOT NULL,snippet TEXT NOT NULL,received_at TEXT NOT NULL,category TEXT,summary TEXT,confidence REAL,extracted_company TEXT,extracted_title TEXT,extracted_city TEXT,proposed_application_id INTEGER,proposed_scheduled_at TEXT,proposed_action_deadline_at TEXT,status TEXT NOT NULL DEFAULT 'pending',linked_application_event_id INTEGER,parser_version TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)""")
             email_columns = {row["name"] for row in conn.execute("PRAGMA table_info(email_events)").fetchall()}
             if "parse_error" not in email_columns: conn.execute("ALTER TABLE email_events ADD COLUMN parse_error TEXT")
+            if "proposed_action_deadline_at" not in email_columns: conn.execute("ALTER TABLE email_events ADD COLUMN proposed_action_deadline_at TEXT")
+            if "extracted_city" not in email_columns: conn.execute("ALTER TABLE email_events ADD COLUMN extracted_city TEXT")
             conn.execute("""CREATE TABLE IF NOT EXISTS job_ai_analyses (id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL, ai_score INTEGER NOT NULL, reasons TEXT NOT NULL, risks TEXT NOT NULL, model_name TEXT NOT NULL, created_at TEXT NOT NULL, prompt_version TEXT NOT NULL, input_fingerprint TEXT NOT NULL)""")
-            self._backfill_applied_events(conn)
 
     @staticmethod
     def _backfill_applied_events(conn: sqlite3.Connection) -> None:
@@ -172,6 +251,26 @@ class JobStore:
     def pending_email_events(self):
         with self.connection() as conn: return conn.execute("SELECT * FROM email_events WHERE status IN ('pending','parse_failed') ORDER BY received_at DESC,id DESC").fetchall()
 
+    def record_email_sync_diagnostic(self, *, started_at: str, finished_at: str, outcome: str,
+                                     diagnostic_category: str, candidate_count: int | None = None,
+                                     created_count: int | None = None, deduplicated_count: int | None = None,
+                                     parser_enabled: bool = False) -> None:
+        """Persist one safe, aggregate-only diagnostic record for the local IMAP run."""
+        with self.connection() as conn:
+            conn.execute("DELETE FROM email_sync_diagnostics")
+            conn.execute(
+                """INSERT INTO email_sync_diagnostics
+                (started_at,finished_at,outcome,diagnostic_category,scan_mailbox,scan_days,scan_limit,
+                 candidate_count,created_count,deduplicated_count,parser_enabled)
+                VALUES(?,?,?,?, 'INBOX',7,50,?,?,?,?)""",
+                (started_at, finished_at, outcome, diagnostic_category, candidate_count,
+                 created_count, deduplicated_count, int(parser_enabled)),
+            )
+
+    def latest_email_sync_diagnostic(self):
+        with self.connection() as conn:
+            return conn.execute("SELECT * FROM email_sync_diagnostics ORDER BY id DESC LIMIT 1").fetchone()
+
     def has_email_dedup(self, dedup_key: str) -> bool:
         with self.connection() as conn:
             return bool(conn.execute("SELECT 1 FROM email_dedup WHERE dedup_key=?", (dedup_key,)).fetchone())
@@ -180,7 +279,7 @@ class JobStore:
         stamp=datetime.now().isoformat(timespec="seconds")
         with self.connection() as conn:
             if conn.execute("SELECT 1 FROM email_dedup WHERE dedup_key=?", (payload["dedup_key"],)).fetchone(): return False
-            conn.execute("INSERT INTO email_events(dedup_key,message_id,sender_domain,subject,snippet,received_at,category,summary,confidence,extracted_company,extracted_title,proposed_application_id,proposed_scheduled_at,status,parser_version,parse_error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (payload["dedup_key"],payload.get("message_id"),payload.get("sender_domain"),payload["subject"][:300],payload["snippet"][:200],payload["received_at"],payload.get("category"),payload.get("summary","")[:30],payload.get("confidence"),payload.get("company","")[:120],payload.get("title","")[:160],payload.get("proposed_application_id"),payload.get("proposed_scheduled_at") or None,payload.get("status","pending"),PARSER_VERSION,payload.get("parse_error","")[:80],stamp,stamp))
+            conn.execute("INSERT INTO email_events(dedup_key,message_id,sender_domain,subject,snippet,received_at,category,summary,confidence,extracted_company,extracted_title,extracted_city,proposed_application_id,proposed_scheduled_at,proposed_action_deadline_at,status,parser_version,parse_error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (payload["dedup_key"],payload.get("message_id"),payload.get("sender_domain"),payload["subject"][:300],payload["snippet"][:200],payload["received_at"],payload.get("category"),payload.get("summary","")[:30],payload.get("confidence"),payload.get("company","")[:120],payload.get("title","")[:160],payload.get("city","")[:120],payload.get("proposed_application_id"),payload.get("proposed_scheduled_at") or None,payload.get("proposed_action_deadline_at") or None,payload.get("status","pending"),PARSER_VERSION,payload.get("parse_error","")[:80],stamp,stamp))
             conn.execute("INSERT INTO email_dedup(dedup_key,key_type,mailbox,action,processed_at) VALUES(?,?,?,?,?)", (payload["dedup_key"],payload.get("key_type","uid"),payload.get("mailbox","INBOX"),payload.get("status","pending"),stamp)); return True
 
     def email_event(self, event_id: int):
@@ -192,7 +291,7 @@ class JobStore:
         with self.connection() as conn:
             if parsed is None:
                 conn.execute("UPDATE email_events SET status='parse_failed',parse_error=?,updated_at=? WHERE id=?", (error[:80],stamp,event_id)); return
-            conn.execute("UPDATE email_events SET category=?,summary=?,confidence=?,extracted_company=?,extracted_title=?,proposed_application_id=?,proposed_scheduled_at=?,status='pending',parse_error=NULL,updated_at=? WHERE id=?", (parsed.category,parsed.summary,parsed.confidence,parsed.company,parsed.title,proposal,parsed.scheduled_date or None,stamp,event_id))
+            conn.execute("UPDATE email_events SET category=?,summary=?,confidence=?,extracted_company=?,extracted_title=?,extracted_city=?,proposed_application_id=?,proposed_scheduled_at=?,proposed_action_deadline_at=?,status='pending',parse_error=NULL,updated_at=? WHERE id=?", (parsed.category,parsed.summary,parsed.confidence,parsed.company,parsed.title,parsed.city,proposal,parsed.scheduled_date or None,parsed.action_deadline or None,stamp,event_id))
 
     def proposed_application(self, company: str, title: str):
         with self.connection() as conn:
@@ -212,21 +311,50 @@ class JobStore:
         company_key, title_key = company.strip().casefold(), title.strip().casefold()
         return [row for row in rows if row["company"].strip().casefold() == company_key and row["title"].strip().casefold() == title_key]
 
-    def resolve_email_event(self, event_id:int, action:str, application_id:int|None=None, confirm_schedule:bool=False) -> None:
+    @staticmethod
+    def _email_target(category: str) -> tuple[str, str] | None:
+        mapping = {
+            "笔试": ("测评/笔试", "笔试通知"),
+            "面试": ("面试", "其他面试"),
+            "Offer": ("Offer", "Offer"),
+            "拒信": ("已结束", "拒信"),
+        }
+        return mapping.get(category)
+
+    def safe_auto_email_match(self, company: str, title: str, category: str) -> int | None:
+        """Return one candidate only when its current state can legally advance."""
+        target = self._email_target(category)
+        matches = self.exact_email_matches(company, title)
+        if not target or len(matches) != 1:
+            return None
+        app = self.application_by_id(matches[0]["id"])
+        if not app or target[0] not in ADVANCE_TARGETS.get(app["status"], ()):
+            return None
+        return int(app["id"])
+
+    def resolve_email_event(self, event_id:int, action:str, application_id:int|None=None, confirm_schedule:bool=False, confirm_action_deadline:bool=False, category_override: str = "", scheduled_override: str = "", action_deadline_override: str = "") -> None:
         with self.connection() as conn:
             event=conn.execute("SELECT * FROM email_events WHERE id=?",(event_id,)).fetchone()
             if not event: raise ValueError("邮件事件不存在")
             if action=='dismissed': conn.execute("UPDATE email_events SET status='dismissed',updated_at=? WHERE id=?",(datetime.now().isoformat(timespec='seconds'),event_id)); return
+            existing_link = conn.execute("SELECT 1 FROM email_event_links WHERE email_event_id=?", (event_id,)).fetchone()
+            if existing_link or event["linked_application_event_id"]:
+                raise ValueError("这封邮件已关联过申请事件，不会重复推进")
             app_id=application_id or event['proposed_application_id']
-            if not app_id or not conn.execute("SELECT 1 FROM applications WHERE id=?",(app_id,)).fetchone(): raise ValueError("请选择有效申请")
-            types={'笔试':'笔试通知','面试':'其他面试','Offer':'Offer','拒信':'拒信'}
-            event_type=types.get(event['category'])
-            if not event_type: raise ValueError("该邮件类型不能创建申请事件")
-            stamp=datetime.now().isoformat(timespec='seconds'); scheduled=event['proposed_scheduled_at'] if confirm_schedule else None
-            cursor=conn.execute("INSERT INTO application_events(application_id,event_type,event_date,scheduled_at,description,created_at) VALUES(?,?,?,?,?,?)",(app_id,event_type,event['received_at'][:10],scheduled,event['summary'] or '来自邮件自动解析',stamp))
-            status={'笔试':'测评/笔试','面试':'面试','Offer':'Offer','拒信':'已结束'}[event['category']]
+            app = conn.execute("SELECT * FROM applications WHERE id=?", (app_id,)).fetchone() if app_id else None
+            if not app: raise ValueError("请选择有效申请")
+            category = category_override.strip() or event['category']
+            target = self._email_target(category)
+            if not target: raise ValueError("该邮件类型不能创建申请事件")
+            status, event_type = target
+            if status not in ADVANCE_TARGETS.get(app["status"], ()):
+                raise ValueError("当前申请状态不允许由这封邮件推进；请保留待确认后人工处理")
+            stamp=datetime.now().isoformat(timespec='seconds'); scheduled=scheduled_override.strip() or (event['proposed_scheduled_at'] if confirm_schedule else None)
+            action_deadline=action_deadline_override.strip() or (event['proposed_action_deadline_at'] if confirm_action_deadline else None)
+            cursor=conn.execute("INSERT INTO application_events(application_id,event_type,event_date,scheduled_at,action_deadline_at,description,created_at) VALUES(?,?,?,?,?,?,?)",(app_id,event_type,event['received_at'][:10],scheduled,action_deadline,event['summary'] or '来自邮件自动解析',stamp))
             conn.execute("UPDATE applications SET status=?,updated_at=? WHERE id=?",(status,stamp,app_id))
-            conn.execute("UPDATE email_events SET status=?,proposed_application_id=?,linked_application_event_id=?,updated_at=? WHERE id=?",('confirmed' if action=='confirmed' else 'auto_applied',app_id,cursor.lastrowid,stamp,event_id))
+            conn.execute("UPDATE email_events SET category=?,status=?,proposed_application_id=?,linked_application_event_id=?,updated_at=? WHERE id=?",(category,'confirmed' if action=='confirmed' else 'auto_applied',app_id,cursor.lastrowid,stamp,event_id))
+            conn.execute("INSERT INTO email_event_links(email_event_id,application_event_id,idempotency_key,created_at) VALUES(?,?,?,?)", (event_id, cursor.lastrowid, f"email-event:{event_id}", stamp))
 
     def link_email_to_manual_application(self, event_id: int, application_id: int) -> None:
         """Record an explicit user link without inventing a parsed stage/event."""
@@ -335,7 +463,86 @@ class JobStore:
 
     def delete(self, job_id: int) -> None:
         with self.connection() as conn:
+            if conn.execute("SELECT 1 FROM applications WHERE job_id=?", (job_id,)).fetchone():
+                raise ValueError("该岗位已有申请记录，为保护申请历史不能删除")
             conn.execute("DELETE FROM job_postings WHERE id=?", (job_id,))
+
+    EXPORT_FIELDS = {
+        "job_postings": ("id", "company", "title", "city", "application_url", "salary_range", "department", "description_text", "deadline", "source", "note", "status", "is_favorite", "duplicate_confirmed", "match_score", "match_reasons", "source_import_id", "created_at", "updated_at"),
+        "candidate_profiles": ("id", "graduation_year", "degree", "school", "major", "target_cities", "target_directions", "target_industries", "skills", "constraints", "created_at", "updated_at"),
+        "applications": ("id", "job_id", "status", "applied_at", "resume_version", "next_action", "next_action_due_at", "notes", "created_at", "updated_at"),
+        "checklist_items": ("id", "application_id", "label", "is_completed", "is_predefined", "sort_order", "created_at", "updated_at"),
+        "application_events": ("id", "application_id", "event_type", "event_date", "scheduled_at", "action_deadline_at", "description", "created_at"),
+        "import_batches": ("id", "filename", "imported_at", "total_rows", "created_count", "skipped_count", "updated_count", "column_mapping", "default_year", "notes"),
+        "ai_settings": ("id", "ai_enabled", "extraction_consent_version", "extraction_consented_at", "semantic_consent_version", "semantic_consented_at", "extraction_last_used_at", "semantic_last_used_at", "enable_email_parsing"),
+        "email_dedup": ("id", "dedup_key", "key_type", "mailbox", "uid", "uid_validity", "content_hash", "action", "processed_at"),
+            "email_events": ("id", "dedup_key", "sender_domain", "subject", "snippet", "received_at", "category", "summary", "confidence", "extracted_company", "extracted_title", "extracted_city", "proposed_application_id", "proposed_scheduled_at", "proposed_action_deadline_at", "status", "linked_application_event_id", "parser_version", "parse_error", "created_at", "updated_at"),
+        "email_event_links": ("email_event_id", "application_event_id", "idempotency_key", "created_at"),
+        "job_ai_analyses": ("id", "job_id", "ai_score", "reasons", "risks", "model_name", "created_at", "prompt_version", "input_fingerprint"),
+    }
+    EXPORT_TABLES = tuple(EXPORT_FIELDS)
+
+    @staticmethod
+    def _redact_export_value(value):
+        if not isinstance(value, str):
+            return value
+        return re.sub(r"(?i)[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}", "[已脱敏邮箱]", value)
+
+    def export_snapshot(self) -> dict:
+        with self.connection() as conn:
+            data = {
+                table: [
+                    {field: self._redact_export_value(row[field]) for field in fields}
+                    for row in conn.execute(f"SELECT {','.join(fields)} FROM {table} ORDER BY rowid").fetchall()
+                ]
+                for table, fields in self.EXPORT_FIELDS.items()
+            }
+        return {"format_version": 1, "app_version": APP_VERSION, "exported_at": datetime.now().isoformat(timespec="seconds"), "data": data}
+
+    def restore_snapshot(self, payload: dict) -> Path:
+        """Verify into an isolated DB, then replace the entire current local database."""
+        if not isinstance(payload, dict) or payload.get("format_version") != 1 or not isinstance(payload.get("data"), dict):
+            raise ValueError("恢复文件格式或版本不受支持")
+        data = payload["data"]
+        if set(data) != set(self.EXPORT_TABLES) or any(not isinstance(data[table], list) for table in self.EXPORT_TABLES):
+            raise ValueError("恢复文件缺少必要数据集合")
+        db = Path(self.db_path)
+        backup_dir = db.parent / "backups"
+        backup_dir.mkdir(exist_ok=True)
+        temp_dir = Path(tempfile.mkdtemp(prefix="campusai-restore-", dir=db.parent))
+        candidate = temp_dir / "validated.db"
+        backup = backup_dir / f"before-restore-{datetime.now():%Y%m%d-%H%M%S}.db"
+        try:
+            isolated = JobStore(candidate)
+            with isolated.connection() as conn:
+                for table in reversed(self.EXPORT_TABLES):
+                    conn.execute(f"DELETE FROM {table}")
+                for table in self.EXPORT_TABLES:
+                    rows = data[table]
+                    if not rows:
+                        continue
+                    columns = list(self.EXPORT_FIELDS[table])
+                    if any(not isinstance(row, dict) or set(row) != set(columns) for row in rows):
+                        raise ValueError(f"恢复文件中的 {table} 结构不一致")
+                    placeholders = ",".join("?" for _ in columns)
+                    conn.executemany(
+                        f"INSERT INTO {table}({','.join(columns)}) VALUES({placeholders})",
+                        [[row[column] for column in columns] for row in rows],
+                    )
+                violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+                if violations:
+                    raise ValueError("恢复文件存在关联关系损坏")
+            isolated._verify_schema()
+            shutil.copy2(db, backup)
+            try:
+                os.replace(candidate, db)
+                self._restart_marker.write_text(json.dumps({"backup": str(backup), "status": "pending_restart_health_check", "replaced_at": datetime.now().isoformat(timespec="seconds")}, ensure_ascii=False), encoding="utf-8")
+            except Exception:
+                shutil.copy2(backup, db)
+                raise
+            return backup
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     def toggle_favorite(self, job_id: int) -> None:
         with self.connection() as conn:
@@ -445,6 +652,8 @@ class JobStore:
                 else:
                     kind = "event"
                 add(event["event_date"], kind, f"{event['event_type']} · {label}", application["id"])
+                add(event["scheduled_at"], kind, f"{event['event_type']}安排 · {label}", application["id"])
+                add(event["action_deadline_at"], "next-action", f"行动截止 · {label}", application["id"])
 
         cells: list[dict[str, object]] = []
         for week in calendar_module.Calendar(firstweekday=0).monthdatescalendar(year, month):
@@ -491,11 +700,12 @@ class JobStore:
             deadlines = conn.execute("""SELECT j.id,j.company,j.title,j.deadline FROM job_postings j
                 LEFT JOIN applications a ON a.job_id=j.id
                 WHERE j.deadline <> '' AND (a.id IS NULL OR a.status='待投递')""").fetchall()
-            events = conn.execute("""SELECT e.id,e.scheduled_at,e.event_type,j.company,j.title FROM application_events e
+            events = conn.execute("""SELECT e.id,e.scheduled_at,e.action_deadline_at,e.event_type,j.company,j.title FROM application_events e
                 JOIN applications a ON a.id=e.application_id JOIN job_postings j ON j.id=a.job_id
-                WHERE e.event_type IN ('其他测评','一面','二面','三面','HR面','其他面试')
-                  AND e.scheduled_at IS NOT NULL AND e.scheduled_at <> ''
-                  AND a.status <> '已结束'""").fetchall()
+                WHERE a.status <> '已结束'
+                  AND ((e.event_type IN ('其他测评','一面','二面','三面','HR面','其他面试')
+                       AND e.scheduled_at IS NOT NULL AND e.scheduled_at <> '')
+                       OR (e.action_deadline_at IS NOT NULL AND e.action_deadline_at <> ''))""").fetchall()
             actions = conn.execute("""SELECT a.id,a.next_action_due_at,j.company,j.title FROM applications a
                 JOIN job_postings j ON j.id=a.job_id
                 WHERE a.next_action_due_at IS NOT NULL AND a.next_action_due_at <> ''
@@ -503,8 +713,12 @@ class JobStore:
         items = []
         for row in deadlines:
             items.append({"source": "deadline", "id": str(row["id"]), "date": row["deadline"][:10], "title": f"DDL：{row['company']} {row['title']}"})
+        scheduled_event_types = {"其他测评", "一面", "二面", "三面", "HR面", "其他面试"}
         for row in events:
-            items.append({"source": "event", "id": str(row["id"]), "date": row["scheduled_at"][:10], "title": f"{row['event_type']}：{row['company']} {row['title']}"})
+            if row["scheduled_at"] and row["event_type"] in scheduled_event_types:
+                items.append({"source": "event", "id": str(row["id"]), "date": row["scheduled_at"][:10], "title": f"{row['event_type']}：{row['company']} {row['title']}"})
+            if row["action_deadline_at"]:
+                items.append({"source": "action-deadline", "id": str(row["id"]), "date": row["action_deadline_at"][:10], "title": f"行动截止：{row['company']} {row['title']}"})
         for row in actions:
             items.append({"source": "nextaction", "id": str(row["id"]), "date": row["next_action_due_at"][:10], "title": f"下一步：{row['company']} {row['title']}"})
         if scope == "future":
@@ -515,13 +729,13 @@ class JobStore:
     def _default_event_description(target_status: str, event_type: str) -> str:
         return f"状态更新为{target_status}" if event_type not in {"备注", "补充材料", "其他记录"} else event_type
 
-    def _insert_event(self, conn: sqlite3.Connection, app_id: int, event_type: str, event_date: str, description: str = "", scheduled_at: str = "") -> None:
+    def _insert_event(self, conn: sqlite3.Connection, app_id: int, event_type: str, event_date: str, description: str = "", scheduled_at: str = "", action_deadline_at: str = "") -> None:
         if event_type not in EVENT_TYPES:
             raise ValueError("无效的事件类型")
         stamp = datetime.now().isoformat(timespec="seconds")
-        conn.execute("INSERT INTO application_events(application_id,event_type,event_date,scheduled_at,description,created_at) VALUES(?,?,?,?,?,?)", (app_id,event_type,event_date,scheduled_at.strip() or None,description.strip() or self._default_event_description("当前阶段", event_type),stamp))
+        conn.execute("INSERT INTO application_events(application_id,event_type,event_date,scheduled_at,action_deadline_at,description,created_at) VALUES(?,?,?,?,?,?,?)", (app_id,event_type,event_date,scheduled_at.strip() or None,action_deadline_at.strip() or None,description.strip() or self._default_event_description("当前阶段", event_type),stamp))
 
-    def advance_application(self, app_id: int, target_status: str, event_type: str, event_date: str, description: str = "", scheduled_at: str = "") -> str:
+    def advance_application(self, app_id: int, target_status: str, event_type: str, event_date: str, description: str = "", scheduled_at: str = "", action_deadline_at: str = "") -> str:
         if target_status not in PROGRESS_STATUSES:
             raise ValueError("无效的目标阶段")
         with self.connection() as conn:
@@ -532,16 +746,16 @@ class JobStore:
                 raise ValueError("不能回退到更早阶段")
             if event_type not in STAGE_EVENT_TYPES[target_status]:
                 raise ValueError("该事件类型不属于目标阶段")
-            self._insert_event(conn, app_id, event_type, event_date, description or self._default_event_description(target_status, event_type), scheduled_at)
+            self._insert_event(conn, app_id, event_type, event_date, description or self._default_event_description(target_status, event_type), scheduled_at, action_deadline_at)
             if target_status != app["status"]:
                 conn.execute("UPDATE applications SET status=?,updated_at=? WHERE id=?", (target_status,datetime.now().isoformat(timespec="seconds"),app_id))
         return target_status
 
-    def add_application_event(self, app_id: int, event_type: str, event_date: str, description: str = "", scheduled_at: str = "") -> None:
+    def add_application_event(self, app_id: int, event_type: str, event_date: str, description: str = "", scheduled_at: str = "", action_deadline_at: str = "") -> None:
         with self.connection() as conn:
             if not conn.execute("SELECT 1 FROM applications WHERE id=?", (app_id,)).fetchone():
                 raise ValueError("投递记录不存在")
-            self._insert_event(conn, app_id, event_type, event_date, description, scheduled_at)
+            self._insert_event(conn, app_id, event_type, event_date, description, scheduled_at, action_deadline_at)
 
     def toggle_item(self, item_id: int):
             with self.connection() as conn: conn.execute("UPDATE checklist_items SET is_completed=1-is_completed,updated_at=? WHERE id=? AND NOT (is_predefined=1 AND sort_order=5)",(datetime.now().isoformat(timespec="seconds"),item_id))
@@ -639,6 +853,115 @@ def friendly_datetime(value: str | None) -> str:
             return value
 
 
+def relative_days(value: str | None) -> str:
+    if not value:
+        return "未记录"
+    try:
+        event_day = datetime.fromisoformat(value).date()
+    except ValueError:
+        try:
+            event_day = date.fromisoformat(value)
+        except ValueError:
+            return ""
+    days = (date.today() - event_day).days
+    if days == 0:
+        return "今天"
+    if days == 1:
+        return "昨天"
+    return f"{abs(days)} 天{'前' if days > 0 else '后'}"
+
+
+def stage_progress(status: str) -> int:
+    return {"已投递": 1, "测评/笔试": 2, "面试": 3, "Offer": 4, "已结束": 4}.get(status, 0)
+
+
+def table_deadline(deadline: str | None) -> str:
+    if not deadline:
+        return "—"
+    try:
+        target = date.fromisoformat(deadline)
+    except ValueError:
+        return deadline
+    days = (target - date.today()).days
+    prefix = target.strftime("%m-%d")
+    if days < 0:
+        return f"{prefix}, 已逾期"
+    if days == 0:
+        return f"{prefix}, 今天截止"
+    return f"{prefix}, {days} 天后"
+
+
+def table_deadline_class(deadline: str | None) -> str:
+    if not deadline:
+        return ""
+    try:
+        days = (date.fromisoformat(deadline) - date.today()).days
+    except ValueError:
+        return ""
+    return "today" if days == 0 else "expired" if days < 0 else "near" if days <= 3 else ""
+
+
+def table_current_timing(application, events) -> dict[str, str | bool]:
+    """Choose the table's single time column according to the active application stage."""
+    status = application["status"]
+    if status in {"待投递", "已投递"}:
+        return {"label": "投递 DDL", "value": application["deadline"] or "", "kind": "deadline"}
+    stage_types = set(STAGE_EVENT_TYPES.get(status, ()))
+    candidates: list[tuple[datetime, str, str, str]] = []
+    for event in events:
+        if event["event_type"] not in stage_types:
+            continue
+        if event["action_deadline_at"]:
+            try:
+                candidates.append((datetime.fromisoformat(event["action_deadline_at"]), "行动截止", event["action_deadline_at"], "deadline"))
+            except ValueError:
+                pass
+        if event["scheduled_at"]:
+            try:
+                candidates.append((datetime.fromisoformat(event["scheduled_at"]), f"{event['event_type']}安排", event["scheduled_at"], "schedule"))
+            except ValueError:
+                pass
+    if candidates:
+        future = [item for item in candidates if item[0].date() >= date.today()]
+        _, label, value, kind = min(future, key=lambda item: item[0]) if future else max(candidates, key=lambda item: item[0])
+        return {"label": label, "value": value, "kind": kind}
+    return {"label": "当前节点未记录", "value": "", "kind": ""}
+
+
+def next_key_milestone(application, events) -> dict[str, str] | None:
+    """Return the next confirmed post-application action; never substitute job DDL."""
+    candidates: list[tuple[datetime, str, str]] = []
+    for event in events:
+        if event["action_deadline_at"]:
+            try:
+                candidates.append((datetime.fromisoformat(event["action_deadline_at"]), "行动截止", event["action_deadline_at"]))
+            except ValueError:
+                pass
+        if event["scheduled_at"]:
+            try:
+                candidates.append((datetime.fromisoformat(event["scheduled_at"]), f"{event['event_type']}安排", event["scheduled_at"]))
+            except ValueError:
+                pass
+    if application["next_action_due_at"]:
+        try:
+            candidates.append((datetime.fromisoformat(application["next_action_due_at"]), "下一步计划", application["next_action_due_at"]))
+        except ValueError:
+            pass
+    if not candidates:
+        return None
+    future = [item for item in candidates if item[0].date() >= date.today()]
+    if future:
+        _, label, value = min(future, key=lambda item: item[0])
+        return {"label": label, "value": value, "overdue": False}
+    _, label, value = max(candidates, key=lambda item: item[0])
+    return {"label": label, "value": value, "overdue": True}
+
+
+def city_summary(cities: str | None) -> str:
+    parts = [part for part in re.split(r"[、,，;；\s]+", cities or "") if part]
+    return f"{parts[0]} +{len(parts) - 1}" if len(parts) > 3 else (cities or "—")
+
+
 def created_ago(created_at: str | None) -> str:
     if not created_at:
         return ""
@@ -669,8 +992,7 @@ def should_auto_apply_email(payload: dict, store: JobStore) -> int | None:
     if payload.get("confidence", 0) < 90:
         return None
     company, title = payload.get("company", ""), payload.get("title", "")
-    matches = store.exact_email_matches(company, title)
-    return matches[0]["id"] if len(matches) == 1 else None
+    return store.safe_auto_email_match(company, title, payload.get("category", ""))
 
 
 def semantic_payload(job: dict, profile: dict) -> dict:
@@ -695,6 +1017,26 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
     templates.env.globals["deadline_countdown"] = deadline_countdown
     templates.env.globals["created_ago"] = created_ago
     templates.env.globals["friendly_datetime"] = friendly_datetime
+    templates.env.globals["relative_days"] = relative_days
+    templates.env.globals["stage_progress"] = stage_progress
+    templates.env.globals["table_deadline"] = table_deadline
+    templates.env.globals["table_deadline_class"] = table_deadline_class
+    templates.env.globals["city_summary"] = city_summary
+
+    @app.middleware("http")
+    async def product_navigation(request: Request, call_next):
+        """Keep the small server-rendered templates discoverable without a base-template rewrite."""
+        response = await call_next(request)
+        if "text/html" not in response.headers.get("content-type", ""):
+            return response
+        body = b"".join([chunk async for chunk in response.body_iterator])
+        if b"</nav>" in body and b'href="/data-management"' not in body:
+            body = body.replace(b"</nav>", '<a href="/data-management">数据管理</a></nav>'.encode("utf-8"), 1)
+        if b"</body>" in body and b"product_actions.js" not in body:
+            body = body.replace(b"</body>", b'<script src="/static/product_actions.js"></script></body>', 1)
+        headers = dict(response.headers)
+        headers.pop("content-length", None)
+        return HTMLResponse(body, status_code=response.status_code, headers=headers)
     app.include_router(create_import_router(templates))
     app.include_router(create_calendar_router())
 
@@ -796,7 +1138,7 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
         return RedirectResponse(url=f"/?saved={created_id}", status_code=303)
 
     @app.get("/jobs")
-    def job_pool(request: Request, q: str = "", state: str = "all", sort: str = "priority", deleted: bool = False, imported: int | None = None, updated: int | None = None, skipped: int | None = None, focus: int | None = None):
+    def job_pool(request: Request, q: str = "", state: str = "all", sort: str = "priority", deleted: bool = False, delete_error: str = "", imported: int | None = None, updated: int | None = None, skipped: int | None = None, focus: int | None = None):
         state = state if state in {"all", "pending", "near", "expired", "today", "week", "favorite", "high"} else "all"
         store = request.app.state.store
         profile = store.profile()
@@ -811,6 +1153,11 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
             "favorite": sum(bool(job["is_favorite"]) for job in all_jobs),
         }
         jobs = store.list(q.strip(), state, sort)
+        filter_labels = {
+            "all": "全部岗位", "pending": "待评估", "near": "临期（未来 3 天）",
+            "today": "今日新增", "week": "本周截止", "favorite": "收藏", "high": "高匹配",
+            "expired": "已逾期",
+        }
         settings = store.ai_settings()
         analyses = {}
         for job in jobs:
@@ -821,8 +1168,13 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
         return templates.TemplateResponse(
             request,
             "pool.html",
-            {"jobs": jobs, "q": q.strip(), "state": state, "deleted": deleted, "imported": imported, "updated": updated, "skipped": skipped, "profile_configured": profile_configured, "profile": profile, "sort": sort, "metrics": metrics, "ai_enabled": bool(settings["ai_enabled"]), "ai_configured": ai_config().configured, "analyses": analyses, "focus": focus},
+            {"jobs": jobs, "q": q.strip(), "state": state, "filter_label": filter_labels[state], "deleted": deleted, "delete_error": delete_error, "imported": imported, "updated": updated, "skipped": skipped, "profile_configured": profile_configured, "profile": profile, "sort": sort, "metrics": metrics, "ai_enabled": bool(settings["ai_enabled"]), "ai_configured": ai_config().configured, "analyses": analyses, "focus": focus},
         )
+
+    @app.get("/email-sync-help")
+    def email_sync_help(request: Request):
+        configured_fields = {name: bool(os.getenv(name)) for name in ("IMAP_SERVER", "IMAP_EMAIL", "IMAP_PASSWORD", "IMAP_AGENT_TOKEN")}
+        return templates.TemplateResponse(request, "email_sync_help.html", {"configured_fields": configured_fields})
 
     @app.get("/ai-settings")
     def ai_settings_page(request: Request):
@@ -832,6 +1184,32 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
     def save_ai_settings_route(request: Request, ai_enabled: str = Form(""), enable_email_parsing: str = Form("")):
         request.app.state.store.save_ai_settings(ai_enabled.lower() in {"1", "true", "on"}, enable_email_parsing.lower() in {"1", "true", "on"})
         return RedirectResponse("/ai-settings", status_code=303)
+
+    @app.get("/data-management")
+    def data_management(request: Request, message: str = "", error: str = ""):
+        return templates.TemplateResponse(request, "data_management.html", {"message": message, "error": error})
+
+    @app.get("/data/export")
+    def export_all_data(request: Request):
+        body = json.dumps(request.app.state.store.export_snapshot(), ensure_ascii=False, indent=2)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        return Response(body, media_type="application/json; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="campusai-export-{stamp}.json"'})
+
+    @app.post("/data/restore")
+    async def restore_all_data(request: Request, backup_file: UploadFile = File(...), confirm_replace: str = Form("")):
+        if confirm_replace.lower() not in {"true", "1", "on", "yes"}:
+            return RedirectResponse("/data-management?error=请确认以全量替换当前本地数据", status_code=303)
+        content = await backup_file.read()
+        if len(content) > 10 * 1024 * 1024:
+            return RedirectResponse("/data-management?error=恢复文件不能超过 10MB", status_code=303)
+        try:
+            payload = json.loads(content.decode("utf-8"))
+            store = request.app.state.store
+            with store._database_lock:
+                backup = store.restore_snapshot(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, OSError, sqlite3.Error) as error:
+            return RedirectResponse("/data-management?error=" + str(error), status_code=303)
+        return RedirectResponse("/data-management?message=已完成隔离验证并替换数据库；替换前备份：" + str(backup) + "。必须重启应用并通过启动健康检查后，系统才会确认恢复成功。", status_code=303)
 
     def agent_authorized(request: Request) -> bool:
         from dotenv import load_dotenv
@@ -852,7 +1230,7 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
         if settings['enable_email_parsing']:
             try:
                 parsed=request.app.state.ai_client.parse_email({'subject':payload['subject'],'sender_domain':payload.get('sender_domain',''),'snippet':payload['snippet']})
-                payload.update({'category':parsed.category,'summary':parsed.summary,'confidence':parsed.confidence,'company':parsed.company,'title':parsed.title,'proposed_scheduled_at':parsed.scheduled_date or None})
+                payload.update({'category':parsed.category,'summary':parsed.summary,'confidence':parsed.confidence,'company':parsed.company,'title':parsed.title,'city':parsed.city,'proposed_scheduled_at':parsed.scheduled_date or None,'proposed_action_deadline_at':parsed.action_deadline or None})
                 proposal=store.proposed_application(parsed.company,parsed.title); payload['proposed_application_id']=proposal
                 auto_application_id = should_auto_apply_email(payload, store)
                 if auto_application_id:
@@ -860,7 +1238,7 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
             except AIUnavailable:
                 fallback = local_email_parse(payload["subject"], payload["snippet"])
                 if fallback:
-                    payload.update({'category':fallback.category,'summary':fallback.summary,'confidence':fallback.confidence,'company':'','title':'','status':'pending','parse_error':'AI 解析未完成，已使用本地低置信规则分类，请人工确认'})
+                    payload.update({'category':fallback.category,'summary':fallback.summary,'confidence':fallback.confidence,'company':fallback.company,'title':fallback.title,'city':fallback.city,'proposed_scheduled_at':fallback.scheduled_date or None,'proposed_action_deadline_at':fallback.action_deadline or None,'status':'pending','parse_error':'AI 解析未完成，已使用本地低置信规则分类，请人工确认'})
                 else:
                     # Do not retain provider details or model output; users only need an actionable safe reason.
                     payload.update({'status':'parse_failed','parse_error':'智能解析暂不可用，可稍后主动重新解析'})
@@ -877,7 +1255,13 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
     @app.post("/api/email-sync")
     def sync_email_once(request: Request):
         """Run the local read-only Agent once, never as a background mailbox watcher."""
+        started_at = datetime.now().isoformat(timespec="seconds")
+        parser_enabled = bool(request.app.state.store.ai_settings()["enable_email_parsing"])
         if not request.app.state.email_sync_lock.acquire(blocking=False):
+            request.app.state.store.record_email_sync_diagnostic(
+                started_at=started_at, finished_at=datetime.now().isoformat(timespec="seconds"),
+                outcome="busy", diagnostic_category="busy", parser_enabled=parser_enabled,
+            )
             return RedirectResponse("/progress?view=email&message=邮箱同步正在进行，请勿重复点击", status_code=303)
         try:
             result = subprocess.run(
@@ -885,29 +1269,72 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
                 cwd=str(BASE_DIR.parent), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90,
                 env={**os.environ, "FASTAPI_PORT": str(request.url.port or 8000)},
             )
-            match = re.search(r"candidate emails: (\d+)", result.stdout)
+            diagnostics_match = re.search(r"sync-diagnostics:\s*(\{.*\})", result.stdout)
+            diagnostics = json.loads(diagnostics_match.group(1)) if diagnostics_match else None
             if result.returncode == 0:
-                message = f"本次同步完成：检查到 {match.group(1) if match else 0} 封候选邮件；重复邮件不会重复加入。"
+                count_keys = ("candidate_count", "created_count", "deduplicated_count")
+                counts_available = isinstance(diagnostics, dict) and all(
+                    isinstance(diagnostics.get(key), int) and not isinstance(diagnostics.get(key), bool)
+                    and diagnostics[key] >= 0 for key in count_keys
+                )
+                if not counts_available:
+                    request.app.state.store.record_email_sync_diagnostic(
+                        started_at=started_at, finished_at=datetime.now().isoformat(timespec="seconds"), outcome="failed",
+                        diagnostic_category="agent_unavailable", parser_enabled=parser_enabled,
+                    )
+                    message = "同步未完成：本地 Agent 未提供可验证的结构化统计，计数不可用。请重试或检查本地配置。"
+                    return RedirectResponse("/progress?view=email&message=" + message, status_code=303)
+                candidate_count = diagnostics["candidate_count"]
+                created_count = diagnostics["created_count"]
+                deduplicated_count = diagnostics["deduplicated_count"]
+                request.app.state.store.record_email_sync_diagnostic(
+                    started_at=started_at, finished_at=datetime.now().isoformat(timespec="seconds"), outcome="success",
+                    diagnostic_category="none", candidate_count=candidate_count, created_count=created_count,
+                    deduplicated_count=deduplicated_count, parser_enabled=parser_enabled,
+                )
+                message = f"同步完成：检查到 {candidate_count} 封候选邮件；按 INBOX、近 7 天、最多 50 封扫描，新增 {created_count} 封，去重 {deduplicated_count} 封。"
             else:
-                message = "本次同步未完成，请检查 AI/IMAP 设置或稍后重试。"
+                output = (result.stdout or "") + "\n" + (result.stderr or "")
+                category = "not_configured" if result.returncode == 2 else "authentication_or_permission" if "auth" in output.lower() or "login" in output.lower() else "connection" if "connect" in output.lower() else "agent_unavailable"
+                request.app.state.store.record_email_sync_diagnostic(
+                    started_at=started_at, finished_at=datetime.now().isoformat(timespec="seconds"), outcome="failed",
+                    diagnostic_category=category, parser_enabled=parser_enabled,
+                )
+                message = "同步未完成：本地配置、授权/权限、连接或 Agent 状态需要检查；请重试或查看本地配置说明。"
         except subprocess.TimeoutExpired:
+            request.app.state.store.record_email_sync_diagnostic(
+                started_at=started_at, finished_at=datetime.now().isoformat(timespec="seconds"), outcome="timeout",
+                diagnostic_category="timeout", parser_enabled=parser_enabled,
+            )
             message = "本次同步超时；未创建或修改任何申请。请稍后重试。"
+        except OSError:
+            request.app.state.store.record_email_sync_diagnostic(
+                started_at=started_at, finished_at=datetime.now().isoformat(timespec="seconds"), outcome="failed",
+                diagnostic_category="agent_unavailable", parser_enabled=parser_enabled,
+            )
+            message = "同步未启动：本地 Python 或邮件 Agent 不可用；计数不可用。请检查本地配置后重试。"
+        except (json.JSONDecodeError, ValueError):
+            request.app.state.store.record_email_sync_diagnostic(
+                started_at=started_at, finished_at=datetime.now().isoformat(timespec="seconds"), outcome="failed",
+                diagnostic_category="agent_unavailable", parser_enabled=parser_enabled,
+            )
+            message = "同步未完成：本地 Agent 未返回可用的统计信息。请重试或查看本地配置说明。"
         finally:
             request.app.state.email_sync_lock.release()
         return RedirectResponse("/progress?view=email&message=" + message, status_code=303)
 
     @app.post('/api/pending-events/{event_id}/confirm')
-    def confirm_pending_event(request: Request,event_id:int,application_id:int=Form(0),confirm_schedule:bool=Form(False)):
+    def confirm_pending_event(request: Request,event_id:int,application_id:int=Form(0),confirm_schedule:bool=Form(False),confirm_action_deadline:bool=Form(False)):
         try:
-            request.app.state.store.resolve_email_event(event_id,'confirmed',application_id or None,confirm_schedule)
+            request.app.state.store.resolve_email_event(event_id,'confirmed',application_id or None,confirm_schedule,confirm_action_deadline)
             message = '邮件已关联，申请阶段已更新'
         except ValueError:
             message = '请先选择一份已投递申请；若尚未记录该投递，请使用“手动补记并关联”'
         return RedirectResponse('/progress?view=email&message='+message,303)
     @app.post('/api/pending-events/{event_id}/relink')
-    def relink_pending_event(request: Request,event_id:int,application_id:int=Form(...),confirm_schedule:bool=Form(False)):
+    def relink_pending_event(request: Request,event_id:int,application_id:int=Form(...),confirm_schedule:bool=Form(False),confirm_action_deadline:bool=Form(False)):
         try:
-            request.app.state.store.resolve_email_event(event_id,'confirmed',application_id,confirm_schedule)
+            request.app.state.store.resolve_email_event(event_id,'confirmed',application_id,confirm_schedule,confirm_action_deadline)
             message = '邮件关联已修正，申请阶段已更新'
         except ValueError:
             message = '关联未完成：请先选择一份已投递申请，或手动补记该投递'
@@ -919,17 +1346,23 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
     @app.post('/api/pending-events/{event_id}/reparse')
     def reparse_email_event(request: Request, event_id: int):
         store=request.app.state.store; event=store.email_event(event_id); settings=store.ai_settings()
-        if not event or event['status'] != 'parse_failed' or not settings['enable_email_parsing']:
+        if not event or event['status'] not in {'pending', 'parse_failed'} or not settings['enable_email_parsing']:
             return RedirectResponse('/progress?view=email&message=当前邮件无法重新解析',303)
         try:
             parsed=request.app.state.ai_client.parse_email({'subject':event['subject'],'sender_domain':event['sender_domain'] or '', 'snippet':event['snippet']})
             store.update_email_parse(event_id, parsed)
-            message='邮件已重新解析，请确认关联'
+            found = []
+            if parsed.scheduled_date: found.append(f"候选安排时间 {parsed.scheduled_date}")
+            if parsed.action_deadline: found.append(f"候选行动截止 {parsed.action_deadline}")
+            message = '邮件已重新解析：' + ('；'.join(found) if found else '未识别到可确认的关键时间，请手动补记')
         except AIUnavailable:
             fallback = local_email_parse(event['subject'], event['snippet'])
             if fallback:
                 store.update_email_parse(event_id, fallback)
-                message='AI 未返回有效结构，已使用本地低置信规则分类，请人工确认关联'
+                found = []
+                if fallback.scheduled_date: found.append(f"候选安排时间 {fallback.scheduled_date}")
+                if fallback.action_deadline: found.append(f"候选行动截止 {fallback.action_deadline}")
+                message = '已使用本地规则重新解析：' + ('；'.join(found) if found else '未识别到可确认的关键时间，请手动补记')
             else:
                 store.update_email_parse(event_id, error='AI 服务超时、返回格式不合法或暂不可用')
                 message='重新解析暂不可用，请稍后手动重试'
@@ -1016,8 +1449,10 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
         return RedirectResponse(url="/applications?tab=sent&message=仅已投递的记录可撤回",status_code=303)
 
     @app.post("/applications/manual")
-    def manual_application(request:Request,company:str=Form(""),title:str=Form(""),city:str=Form(""),source:str=Form("其他"),application_url:str=Form(""),email_event_id:int|None=Form(None)):
+    def manual_application(request:Request,company:str=Form(""),title:str=Form(""),city:str=Form(""),source:str=Form("其他"),application_url:str=Form(""),email_event_id:int|None=Form(None),confirm_schedule:bool=Form(False),confirm_action_deadline:bool=Form(False),event_category:str=Form(""),scheduled_at:str=Form(""),action_deadline_at:str=Form(""),return_to:str=Form("")):
         if not company.strip() or not title.strip() or not city.strip(): return RedirectResponse(url="/applications?message=请填写公司、岗位和地点",status_code=303)
+        if (scheduled_at and not valid_event_datetime(scheduled_at)) or (action_deadline_at and not valid_event_datetime(action_deadline_at)):
+            return RedirectResponse(url="/progress?view=email&message=请输入有效的安排或行动截止时间",status_code=303)
         store=request.app.state.store
         app_id=store.create_manual_application({"company":company.strip(),"title":title.strip(),"city":city.strip(),"source":source,"application_url":application_url.strip(),"salary_range":"","department":"","description_text":"","deadline":"","note":"手动记录已投递"})
         message = '已手动记录投递'
@@ -1025,17 +1460,19 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
             event=store.email_event(email_event_id)
             if event and event["status"] == "pending" and event["category"]:
                 # The user explicitly chose this email while creating the application.
-                store.resolve_email_event(email_event_id, 'confirmed', app_id)
+                store.resolve_email_event(email_event_id, 'confirmed', app_id, confirm_schedule, confirm_action_deadline, event_category, scheduled_at, action_deadline_at)
                 message = '已手动记录投递并关联邮件；申请阶段已按该邮件更新'
             elif event and event["status"] == "parse_failed":
                 store.link_email_to_manual_application(email_event_id, app_id)
                 message = '已手动记录投递并关联邮件；邮件尚未能确定阶段'
-        return RedirectResponse(url="/applications?tab=sent&message="+message,status_code=303)
+        destination = "/progress?view=email&message=" if return_to == "email" else "/applications?tab=sent&message="
+        return RedirectResponse(url=destination + message,status_code=303)
 
     @app.get("/progress")
-    def application_progress(request: Request, state: str = "all", view: str = "list", year: int | None = None, month: int | None = None, focus: int | None = None, message: str = ""):
+    def application_progress(request: Request, state: str = "all", view: str = "list", table_sort: str = "priority", year: int | None = None, month: int | None = None, focus: int | None = None, message: str = ""):
         state = state if state in {"all", *PROGRESS_STATUSES} else "all"
-        view = view if view in {"list", "calendar", "email"} else "list"
+        view = view if view in {"list", "table", "calendar", "email"} else "list"
+        table_sort = table_sort if table_sort in {"priority", "deadline", "applied"} else "priority"
         today_date = date.today()
         year = year if year and 2000 <= year <= 2100 else today_date.year
         month = month if month and 1 <= month <= 12 else today_date.month
@@ -1044,9 +1481,33 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
         following_month = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
         store = request.app.state.store
         applications = store.list_progress_applications(state)
+        event_map = {row["id"]: store.application_events(row["id"]) for row in applications}
+        key_milestones = {row["id"]: next_key_milestone(row, event_map[row["id"]]) for row in applications}
+        table_timings = {row["id"]: table_current_timing(row, event_map[row["id"]]) for row in applications}
+        status_order = {"已投递": 0, "测评/笔试": 1, "面试": 2, "Offer": 3, "已结束": 4}
+        def ddl_value(row):
+            try: return date.fromisoformat(row["deadline"]) if row["deadline"] else date.max
+            except ValueError: return date.max
+        if table_sort == "deadline":
+            def current_time_value(row):
+                value = table_timings[row["id"]]["value"]
+                try:
+                    return datetime.fromisoformat(value) if "T" in value else datetime.combine(date.fromisoformat(value), datetime.min.time())
+                except (TypeError, ValueError):
+                    return datetime.max
+            table_applications = sorted(applications, key=lambda row: (current_time_value(row), status_order.get(row["status"], 9)))
+        elif table_sort == "applied":
+            table_applications = sorted(applications, key=lambda row: row["applied_at"] or "", reverse=True)
+        else:
+            table_applications = sorted(applications, key=lambda row: (status_order.get(row["status"], 9), ddl_value(row), -(row["match_score"] or -1)))
         context = {
             "applications": applications,
-            "events": {row["id"]: store.application_events(row["id"]) for row in applications},
+            "events": event_map,
+            "key_milestones": key_milestones,
+            "table_timings": table_timings,
+            "table_applications": table_applications,
+            "table_sort": table_sort,
+            "table_summary": {"total": len(table_applications), "expired": sum(table_deadline_class(row["deadline"]) == "expired" for row in table_applications)},
             "state": state,
             "view": view,
             "counts": store.progress_counts(),
@@ -1063,16 +1524,17 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
             "previous_month": previous_month,
             "following_month": following_month,
             "pending_email_events": store.pending_email_events(), "all_applications": store.list_progress_applications(),
+            "email_sync_diagnostic": store.latest_email_sync_diagnostic(),
         }
         template = "calendar.html" if view == "calendar" else "progress.html"
         return templates.TemplateResponse(request, template, context)
 
     @app.post("/progress/{app_id}/advance")
-    def advance_progress(request: Request, app_id: int, target_status: str = Form(""), event_type: str = Form(""), event_date: str = Form(""), description: str = Form(""), scheduled_at: str = Form("")):
-        if not valid_event_datetime(event_date) or (scheduled_at and not valid_event_datetime(scheduled_at)):
+    def advance_progress(request: Request, app_id: int, target_status: str = Form(""), event_type: str = Form(""), event_date: str = Form(""), description: str = Form(""), scheduled_at: str = Form(""), action_deadline_at: str = Form("")):
+        if not valid_event_datetime(event_date) or (scheduled_at and not valid_event_datetime(scheduled_at)) or (action_deadline_at and not valid_event_datetime(action_deadline_at)):
             return RedirectResponse(url=f"/progress?focus={app_id}&message=请输入有效的事件日期", status_code=303)
         try:
-            target = request.app.state.store.advance_application(app_id, target_status, event_type, event_date, description, scheduled_at)
+            target = request.app.state.store.advance_application(app_id, target_status, event_type, event_date, description, scheduled_at, action_deadline_at)
             app = request.app.state.store.application_by_id(app_id)
             job = request.app.state.store.get(app["job_id"]) if app else None
             message = f"已更新：{job['company']} · {job['title']} → {target}" if job else "申请进度已更新"
@@ -1081,11 +1543,11 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
         return RedirectResponse(url=f"/progress?focus={app_id}&message={message}", status_code=303)
 
     @app.post("/progress/{app_id}/events")
-    def add_progress_event(request: Request, app_id: int, event_type: str = Form(""), event_date: str = Form(""), description: str = Form(""), scheduled_at: str = Form("")):
-        if not valid_event_datetime(event_date) or (scheduled_at and not valid_event_datetime(scheduled_at)):
+    def add_progress_event(request: Request, app_id: int, event_type: str = Form(""), event_date: str = Form(""), description: str = Form(""), scheduled_at: str = Form(""), action_deadline_at: str = Form("")):
+        if not valid_event_datetime(event_date) or (scheduled_at and not valid_event_datetime(scheduled_at)) or (action_deadline_at and not valid_event_datetime(action_deadline_at)):
             return RedirectResponse(url=f"/progress?focus={app_id}&message=请输入有效的事件日期", status_code=303)
         try:
-            request.app.state.store.add_application_event(app_id, event_type, event_date, description, scheduled_at)
+            request.app.state.store.add_application_event(app_id, event_type, event_date, description, scheduled_at, action_deadline_at)
             message = "事件已添加"
         except ValueError as error:
             message = str(error)
@@ -1117,15 +1579,58 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="岗位不存在")
         return render_form(request, form=dict(job), editing=job)
 
-    @app.post("/jobs/{job_id}/delete")
-    def delete_job(request: Request, job_id: int):
+    @app.get("/api/jobs/{job_id}/delete-info")
+    def delete_job_info(request: Request, job_id: int):
         store: JobStore = request.app.state.store
         if not store.get(job_id):
             raise HTTPException(status_code=404, detail="岗位不存在")
-        store.delete(job_id)
+        return {"application_count": 1 if store.application(job_id) else 0}
+
+    @app.get("/jobs/{job_id}/delete")
+    def delete_job_confirmation(request: Request, job_id: int):
+        store: JobStore = request.app.state.store
+        job = store.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="岗位不存在")
+        count = 1 if store.application(job_id) else 0
+        blocked = count > 0
+        action = "" if blocked else f"<form method='post' action='/jobs/{job_id}/delete'><input type='hidden' name='confirmed' value='true'><button type='submit'>确认删除岗位</button></form>"
+        return HTMLResponse(
+            "<!doctype html><html lang='zh-CN'><meta charset='utf-8'><title>确认删除岗位</title>"
+            f"<main><h1>确认删除岗位</h1><p>{job['company']} · {job['title']}</p><p>关联申请数量：{count}</p>"
+            + ("<p>为保护申请历史，该岗位不能删除。</p>" if blocked else "<p>删除后无法恢复该岗位记录。请确认。</p>")
+            + action + "<p><a href='/jobs'>返回岗位池</a></p></main></html>",
+            status_code=409 if blocked else 200,
+        )
+
+    @app.post("/jobs/{job_id}/delete")
+    def delete_job(request: Request, job_id: int, confirmed: str = Form("")):
+        store: JobStore = request.app.state.store
+        if not store.get(job_id):
+            raise HTTPException(status_code=404, detail="岗位不存在")
+        application_count = 1 if store.application(job_id) else 0
+        if confirmed.strip().lower() not in {"true", "1", "on", "yes"}:
+            return Response(
+                "<!doctype html><html lang='zh-CN'><meta charset='utf-8'><title>需要删除确认</title>"
+                f"<main><h1>需要删除确认</h1><p>关联申请数量：{application_count}</p>"
+                "<p>未收到服务端确认参数，岗位未删除。</p><p><a href='/jobs'>返回岗位池</a></p></main></html>",
+                media_type="text/html; charset=utf-8", status_code=400,
+            )
+        try:
+            store.delete(job_id)
+        except ValueError as error:
+            return Response(
+                f"<!doctype html><html lang='zh-CN'><meta charset='utf-8'><title>岗位未删除</title>"
+                f"<main><h1>岗位未删除</h1><p>{str(error)}</p><p>关联申请数量：{application_count}</p>"
+                "<p>申请、事件和检查项均未修改。</p><p><a href='/progress'>查看关联申请</a> · <a href='/jobs'>返回岗位池</a></p></main></html>",
+                media_type="text/html; charset=utf-8",
+                status_code=409,
+            )
         return RedirectResponse(url="/jobs?deleted=true", status_code=303)
 
     return app
 
 
-app = create_app()
+# Test and maintenance processes may point the import-time application at an isolated local DB.
+# Normal launches still use manual_capture/campusai_manual.db.
+app = create_app(os.getenv("CAMPUSAI_DB_PATH") or None)

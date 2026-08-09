@@ -9,6 +9,23 @@ depends_on = None
 
 def upgrade():
     inspector = sa.inspect(op.get_bind())
+    if not inspector.has_table("job_postings"):
+        op.create_table(
+            "job_postings",
+            sa.Column("id", sa.Integer, primary_key=True),
+            sa.Column("company", sa.Text, nullable=False),
+            sa.Column("title", sa.Text, nullable=False),
+            sa.Column("city", sa.Text, nullable=False),
+            sa.Column("application_url", sa.Text),
+            sa.Column("salary_range", sa.Text),
+            sa.Column("deadline", sa.Text),
+            sa.Column("source", sa.Text, nullable=False, server_default="其他"),
+            sa.Column("note", sa.Text),
+            sa.Column("status", sa.Text, nullable=False, server_default="待评估"),
+            sa.Column("created_at", sa.Text, nullable=False),
+            sa.Column("updated_at", sa.Text, nullable=False),
+        )
+        inspector = sa.inspect(op.get_bind())
     if not inspector.has_table("candidate_profiles"):
         op.create_table("candidate_profiles", sa.Column("id", sa.Integer, primary_key=True), sa.Column("graduation_year", sa.Text), sa.Column("degree", sa.Text), sa.Column("school", sa.Text), sa.Column("major", sa.Text), sa.Column("target_cities", sa.Text), sa.Column("target_directions", sa.Text), sa.Column("target_industries", sa.Text), sa.Column("skills", sa.Text), sa.Column("constraints", sa.Text), sa.Column("created_at", sa.Text, nullable=False), sa.Column("updated_at", sa.Text, nullable=False))
     present = {column["name"] for column in inspector.get_columns("job_postings")}

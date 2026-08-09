@@ -86,14 +86,16 @@
       <button type="button" class="dialog-close" onclick="this.closest('dialog').close()">关闭</button>
       <h2>手动记录已投递</h2>
       <p>用于在 BOSS、官网或其他渠道已经完成投递的岗位。</p>
-      {% if manual_event %}<div class="alert warning">此操作会手动创建一条“已投递”申请，并明确关联邮件《{{ manual_event.subject }}》。若邮件已有“笔试/面试/Offer/拒信”分类，保存即表示你确认该分类，会同步更新这份新申请的阶段；解析失败邮件则只建立关联，不推断阶段。</div><input type="hidden" name="email_event_id" value="{{ manual_event.id }}">{% endif %}
-      <label>公司名 *<input name="company" required></label>
-      <label>岗位名 *<input name="title" required></label>
-      <label>工作地点 *<input name="city" required></label>
+      {% if manual_event %}<div class="alert warning">此操作会手动创建一条“已投递”申请，并明确关联邮件《{{ manual_event.subject }}》。已从邮件预填的信息仍需你核对；候选行动截止不会写入岗位投递 DDL，而是在保存后作为该邮件事件的关键时间。</div><input type="hidden" name="email_event_id" value="{{ manual_event.id }}"><input type="hidden" name="return_to" value="email">{% endif %}
+      <label>公司名 *<input name="company" value="{{ manual_event.extracted_company if manual_event else '' }}" required></label>
+      <label>岗位名 *<input name="title" value="{{ manual_event.extracted_title if manual_event else '' }}" required></label>
+      <label>工作地点 *<input name="city" value="{{ manual_event.extracted_city if manual_event else '' }}" required></label>
       <label>来源
         <select name="source"><option>其他</option><option>官网</option><option>BOSS直聘</option><option>牛客</option><option>公众号</option></select>
       </label>
       <label>投递链接<input name="application_url" type="url"></label>
+      {% if manual_event and manual_event.proposed_scheduled_at %}<label><input type="checkbox" name="confirm_schedule" value="true">确认候选安排时间：{{ friendly_datetime(manual_event.proposed_scheduled_at) }}</label>{% endif %}
+      {% if manual_event and manual_event.proposed_action_deadline_at %}<label><input type="checkbox" name="confirm_action_deadline" value="true">确认候选行动截止：{{ friendly_datetime(manual_event.proposed_action_deadline_at) }}</label>{% endif %}
       <button type="submit">{% if manual_event %}保存并关联此邮件{% else %}保存为已投递{% endif %}</button>
     </form>
   </dialog>

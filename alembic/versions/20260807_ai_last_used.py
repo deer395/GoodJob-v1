@@ -12,8 +12,11 @@ branch_labels = None
 depends_on = None
 
 def upgrade():
-    op.add_column("ai_settings", sa.Column("extraction_last_used_at", sa.String()))
-    op.add_column("ai_settings", sa.Column("semantic_last_used_at", sa.String()))
+    columns = {column["name"] for column in sa.inspect(op.get_bind()).get_columns("ai_settings")}
+    if "extraction_last_used_at" not in columns:
+        op.add_column("ai_settings", sa.Column("extraction_last_used_at", sa.String()))
+    if "semantic_last_used_at" not in columns:
+        op.add_column("ai_settings", sa.Column("semantic_last_used_at", sa.String()))
 
 def downgrade():
     op.drop_column("ai_settings", "semantic_last_used_at")

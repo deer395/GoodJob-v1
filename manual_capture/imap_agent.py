@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path: sys.path.insert(0, str(ROOT))
-from manual_capture.email_processing import candidate_subject, dedup_key, redact
+from manual_capture.email_processing import candidate_subject, dedup_key, email_excerpt
 
 load_dotenv(ROOT / '.env')
 def local_api_url() -> str:
@@ -40,11 +40,10 @@ def main():
             imaplib.Commands.setdefault('ID', ('AUTH', 'SELECTED'))
             client._simple_command('ID', '("name" "GoodJobAI" "version" "1.0")')
         except (imaplib.IMAP4.error, KeyError): pass
-        print('folders:', ', '.join(item.decode(errors='ignore')[-30:] for item in client.list()[1] or []))
         selected,selected_data=client.select('INBOX', readonly=True)
         if selected != 'OK': print('无法以只读方式选择 INBOX（服务器状态：' + str(selected_data)[:160] + '）'); return 1
         status,data=client.uid('search',None,'SINCE',(datetime.now()-timedelta(days=7)).strftime('%d-%b-%Y'))
-        count=0
+        count=created=deduplicated=0
         for uid in (data[0].split() if status=='OK' else [])[:50]:
             ok,raw=client.uid('fetch',uid,'(BODY.PEEK[HEADER] BODY.PEEK[TEXT])'); message=email.message_from_bytes(b''.join(item[1] for item in raw if isinstance(item,tuple)))
             subject=decoded(message.get('Subject'));
@@ -52,11 +51,17 @@ def main():
             count+=1
             if args.dry_run: continue
             received=(parsedate_to_datetime(message.get('Date')) if message.get('Date') else datetime.now()).isoformat(); key,key_type=dedup_key('INBOX','unknown',uid.decode(),message.get('Message-ID'),subject,message.get('From',''),received)
-            payload={'dedup_key':key,'key_type':key_type,'subject':subject[:300],'snippet':redact(text_part(message)),'received_at':received,'message_id':message.get('Message-ID'),'sender_domain':(message.get('From','').split('@')[-1].split('>')[0])}
+            payload={'dedup_key':key,'key_type':key_type,'subject':subject[:300],'snippet':email_excerpt(text_part(message)),'received_at':received,'message_id':message.get('Message-ID'),'sender_domain':(message.get('From','').split('@')[-1].split('>')[0])}
             token=os.getenv('IMAP_AGENT_TOKEN','');
             if not token: print('IMAP Agent Token 尚未配置，请检查 .env'); return 2
-            request=Request(local_api_url(),data=json.dumps(payload).encode(),headers={'Authorization':'Bearer '+token,'Content-Type':'application/json'},method='POST'); urlopen(request,timeout=35).read()
+            request=Request(local_api_url(),data=json.dumps(payload).encode(),headers={'Authorization':'Bearer '+token,'Content-Type':'application/json'},method='POST')
+            response=json.loads(urlopen(request,timeout=35).read().decode('utf-8'))
+            if response.get('created'):
+                created+=1
+            else:
+                deduplicated+=1
         print(f'candidate emails: {count}; dry-run={args.dry_run}')
+        print('sync-diagnostics: '+json.dumps({'candidate_count':count,'created_count':created,'deduplicated_count':deduplicated},ensure_ascii=False))
     finally: client.logout()
     return 0
 if __name__=='__main__': sys.exit(main())

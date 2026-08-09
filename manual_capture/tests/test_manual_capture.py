@@ -1,12 +1,15 @@
 from datetime import date, timedelta
 from io import BytesIO
 import json
+import sqlite3
+import importlib.util
+from pathlib import Path
 
 import pytest
 
 from fastapi.testclient import TestClient
 
-from manual_capture.app import create_app
+from manual_capture.app import JobStore, create_app
 from manual_capture.import_routes import default_mapping
 
 
@@ -75,9 +78,109 @@ def test_note_limit_and_delete_from_edit_page(tmp_path):
 
     test_client.post("/jobs", data=payload())
     job_id = test_client.app.state.store.list()[0]["id"]
-    deleted = test_client.post(f"/jobs/{job_id}/delete", follow_redirects=True)
+    deleted = test_client.post(f"/jobs/{job_id}/delete", data={"confirmed": "true"}, follow_redirects=True)
     assert deleted.status_code == 200
     assert test_client.app.state.store.list() == []
+
+
+def test_job_with_any_application_cannot_be_deleted_and_history_stays_visible(tmp_path):
+    app = create_app(tmp_path / "protected-delete.db")
+    client = TestClient(app)
+    response = client.post("/jobs", data=payload(company="保护公司", title="研发工程师", city="北京"), follow_redirects=False)
+    job_id = int(response.headers["location"].split("=")[-1])
+    app_id = app.state.store.create_application(job_id)
+    unconfirmed = client.post(f"/jobs/{job_id}/delete", follow_redirects=True)
+    assert unconfirmed.status_code == 400 and "关联申请数量：1" in unconfirmed.text
+    blocked = client.post(f"/jobs/{job_id}/delete", data={"confirmed": "true"}, follow_redirects=True)
+    assert blocked.status_code == 409 and "不能删除" in blocked.text and "关联申请数量：1" in blocked.text
+    assert app.state.store.get(job_id) is not None
+    assert app.state.store.application_by_id(app_id) is not None
+
+
+def test_data_management_is_discoverable_and_job_delete_has_confirmable_frontend_flow(tmp_path):
+    app = create_app(tmp_path / "frontend-entry.db")
+    client = TestClient(app)
+    response = client.post("/jobs", data=payload(company="前台公司", title="产品经理", city="杭州"), follow_redirects=False)
+    job_id = int(response.headers["location"].split("=")[-1])
+    for path in ("/", "/jobs", "/applications", "/progress", "/ai-settings"):
+        page = client.get(path)
+        assert 'href="/data-management"' in page.text
+        assert "/static/product_actions.js" in page.text
+    assert client.get("/data-management").status_code == 200
+    confirmation = client.get(f"/jobs/{job_id}/delete")
+    assert confirmation.status_code == 200
+    assert "关联申请数量：0" in confirmation.text
+    assert "name='confirmed' value='true'" in confirmation.text
+    script = client.get("/static/product_actions.js")
+    assert script.status_code == 200 and "确认删除岗位" in script.text and "delete-info" in script.text
+
+
+def test_full_export_and_isolated_replace_restore_are_complete_and_safe(tmp_path):
+    source = create_app(tmp_path / "source.db")
+    source_store = source.state.store
+    job_id = source_store.create({"company": "导出公司", "title": "数据工程师", "city": "上海", "source": "其他", "application_url": "", "salary_range": "", "department": "", "description_text": "", "deadline": "2026-08-30", "note": "脱敏备注"})
+    app_id = source_store.create_application(job_id)
+    assert source_store.confirm_application(app_id)
+    source_store.insert_email_event({"dedup_key": "export:email", "message_id": "secret@example.com", "subject": "联系 secret@example.com", "snippet": "脱敏摘要 secret@example.com", "received_at": "2026-08-09T10:00:00", "category": "笔试", "confidence": 45})
+    exported = TestClient(source).get("/data/export")
+    assert exported.status_code == 200
+    assert "API_KEY" not in exported.text and "授权码" not in exported.text and "secret@example.com" not in exported.text
+    payload_data = exported.json()
+    assert payload_data["format_version"] == 1
+    assert payload_data["app_version"]
+    assert "message_id" not in payload_data["data"]["email_events"][0]
+    assert len(payload_data["data"]["job_postings"]) == 1
+
+    target = create_app(tmp_path / "target.db")
+    restored = TestClient(target).post("/data/restore", files={"backup_file": ("backup.json", exported.content, "application/json")}, data={"confirm_replace": "true"}, follow_redirects=True)
+    assert restored.status_code == 200
+    assert target.state.store.get(job_id)["company"] == "导出公司"
+    assert target.state.store.application_by_id(app_id)["status"] == "已投递"
+    assert "已脱敏邮箱" in target.state.store.email_event(1)["subject"]
+    assert target.state.store._restart_marker.exists()
+    restarted = JobStore(target.state.store.db_path)
+    assert not restarted._restart_marker.exists()
+    assert restarted._restart_marker.with_suffix(".restore-verified.json").exists()
+
+    before_bad_restore = target.state.store.export_snapshot()
+    bad = TestClient(target).post("/data/restore", files={"backup_file": ("bad.json", b'{"format_version": 999}', "application/json")}, data={"confirm_replace": "true"}, follow_redirects=True)
+    assert "当前数据库未被修改" in bad.text
+    assert target.state.store.export_snapshot()["data"] == before_bad_restore["data"]
+
+
+def test_initialize_upgrades_a_legacy_local_schema_through_alembic(tmp_path):
+    legacy_path = tmp_path / "legacy.db"
+    legacy = JobStore.__new__(JobStore)
+    legacy.db_path = str(legacy_path)
+    legacy.legacy_initialize()
+    upgraded = JobStore(legacy_path)
+    with sqlite3.connect(legacy_path) as conn:
+        revision = conn.execute("SELECT version_num FROM alembic_version").fetchone()[0]
+        link_table = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='email_event_links'").fetchone()
+    assert revision == "20260809_email_sync_diagnostics"
+    assert link_table is not None
+    assert upgraded.get(999) is None
+
+
+def test_migration_creates_backup_before_a_failed_upgrade(tmp_path, monkeypatch):
+    import manual_capture.app as app_module
+    legacy_path = tmp_path / "migration-failure.db"
+    legacy = JobStore.__new__(JobStore)
+    legacy.db_path = str(legacy_path)
+    legacy.legacy_initialize()
+    monkeypatch.setattr(app_module.command, "upgrade", lambda *_: (_ for _ in ()).throw(RuntimeError("upgrade failed")))
+    with pytest.raises(RuntimeError, match="upgrade failed"):
+        JobStore(legacy_path)
+    assert list((tmp_path / "backups").glob("before-migration-*.db"))
+
+
+def test_data_safety_migration_is_explicitly_irreversible():
+    migration = Path(__file__).parents[2] / "alembic" / "versions" / "20260809_data_safety_baseline.py"
+    spec = importlib.util.spec_from_file_location("data_safety_migration", migration)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with pytest.raises(RuntimeError, match="intentionally irreversible"):
+        module.downgrade()
 
 
 def test_pool_shows_external_link_only_when_a_job_has_one(tmp_path):
@@ -237,6 +340,57 @@ def test_progress_page_excludes_pending_and_saves_plan_and_withdraws(tmp_path):
     assert test_client.app.state.store.application_events(1)
 
 
+def test_progress_table_view_renders_rows_sorting_and_focus_links(tmp_path):
+    test_client = client(tmp_path)
+    near = (date.today() + timedelta(days=2)).isoformat()
+    test_client.post("/jobs", data=payload(company="表格公司", title="数据分析师", city="上海, 杭州, 宁波, 合肥", deadline=near))
+    test_client.post("/jobs/1/prepare")
+    assert test_client.app.state.store.confirm_application(1)
+
+    page = test_client.get("/progress?view=table&table_sort=deadline")
+    assert page.status_code == 200
+    assert "表格视图" in page.text and "表格公司" in page.text
+    assert 'data-row-href="/progress?view=list&focus=1"' in page.text
+    assert "table-near" in page.text
+    assert "阶段优先" in page.text and "投递时间" in page.text
+    assert "匹配度" not in page.text and "最近事件" not in page.text
+    assert "上海 +3" in page.text
+    assert "投递 DDL" in page.text and near[5:] in page.text
+    assert "合计 1 份申请" in page.text
+    assert page.text.count("<tr") == 3  # header, one explicit application row, and summary row
+
+
+def test_table_separates_job_deadline_from_confirmed_next_key_milestone(tmp_path):
+    test_client = client(tmp_path)
+    job_deadline = (date.today() + timedelta(days=20)).isoformat()
+    action_deadline = (date.today() + timedelta(days=2)).isoformat() + "T20:00"
+    test_client.post("/jobs", data=payload(company="关键时间公司", deadline=job_deadline))
+    test_client.post("/jobs/1/prepare")
+    store = test_client.app.state.store
+    assert store.confirm_application(1)
+    store.advance_application(1, "测评/笔试", "笔试通知", date.today().isoformat(), action_deadline_at=action_deadline)
+
+    page = test_client.get("/progress?view=table")
+    assert "当前节点截止／安排" in page.text
+    assert "行动截止" in page.text and action_deadline[5:10] in page.text
+    assert job_deadline[5:] not in page.text
+
+
+def test_email_key_times_require_separate_explicit_confirmation(tmp_path):
+    app = create_app(tmp_path / "email-key-times.db")
+    store = app.state.store
+    job_id = store.create({"company": "时间公司", "title": "产品经理", "city": "上海", "source": "其他", "application_url": "", "salary_range": "", "department": "", "description_text": "", "deadline": "2026-09-01", "note": ""})
+    app_id = store.create_application(job_id)
+    assert store.confirm_application(app_id)
+    assert store.insert_email_event({"dedup_key": "test:key-times", "subject": "在线测评", "snippet": "请完成测评", "received_at": "2026-08-09T10:00:00", "category": "笔试", "summary": "在线测评通知", "confidence": 70, "proposed_scheduled_at": "2026-08-12T14:00", "proposed_action_deadline_at": "2026-08-12T20:00"})
+
+    store.resolve_email_event(1, "confirmed", app_id, confirm_schedule=False, confirm_action_deadline=True)
+    linked_event = next(item for item in store.application_events(app_id) if item["event_type"] == "笔试通知")
+    assert linked_event["scheduled_at"] is None
+    assert linked_event["action_deadline_at"] == "2026-08-12T20:00"
+    assert any(item["source"] == "action-deadline" for item in store.calendar_export_entries("future", date.today()))
+
+
 def test_progress_calendar_projects_existing_events_deadlines_and_plan_time(tmp_path):
     test_client = client(tmp_path)
     today = date.today()
@@ -253,6 +407,19 @@ def test_progress_calendar_projects_existing_events_deadlines_and_plan_time(tmp_
     assert "DDL · 字节跳动 · 产品经理" in calendar_page.text
     assert "一面 · 字节跳动 · 产品经理" in calendar_page.text
     assert "下一步 · 字节跳动 · 产品经理" in calendar_page.text
+
+
+def test_progress_calendar_projects_confirmed_schedule_and_action_deadline(tmp_path):
+    test_client = client(tmp_path)
+    target = (date.today() + timedelta(days=2)).isoformat()
+    test_client.post("/jobs", data=payload(company="日历关键节点", deadline=(date.today() + timedelta(days=30)).isoformat()))
+    test_client.post("/jobs/1/prepare")
+    store = test_client.app.state.store
+    assert store.confirm_application(1)
+    store.advance_application(1, "测评/笔试", "笔试通知", date.today().isoformat(), scheduled_at=f"{target}T10:00", action_deadline_at=f"{target}T20:00")
+    page = test_client.get(f"/progress?view=calendar&year={date.today().year}&month={date.today().month}")
+    assert "笔试通知安排 · 日历关键节点 · 产品经理" in page.text
+    assert "行动截止 · 日历关键节点 · 产品经理" in page.text
 
 
 def test_xlsx_import_maps_dates_tracks_batch_and_preserves_protected_fields(tmp_path):
