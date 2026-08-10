@@ -23,7 +23,7 @@
           <td><span class="{% if city_summary(application.city) != application.city %}city-summary{% endif %}" title="{{ application.city }}">{{ city_summary(application.city) }}</span></td>
           <td>{% if application.applied_at %}{{ friendly_datetime(application.applied_at)[:5] }}{% else %}—{% endif %}</td>
           <td class="table-stage"><span class="stage-badge">{{ application.status }}</span><div class="stage-progress" title="{{ stage_progress(application.status) }}/4"><span style="width: {{ stage_progress(application.status) * 25 }}%"></span></div></td>
-          <td class="next-milestone-cell {% if table_timings[application.id].value and table_deadline_class(table_timings[application.id].value[:10]) == 'expired' %}overdue{% endif %}">{% if table_timings[application.id].value %}<strong>{{ table_timings[application.id].label }}</strong><small>{{ friendly_datetime(table_timings[application.id].value) }}</small>{% else %}—{% endif %}</td>
+          <td class="next-milestone-cell{% if table_timings[application.id].value and table_deadline_class(table_timings[application.id].value[:10]) == 'expired' %} overdue{% endif %}{% if table_timings[application.id].value and table_deadline_class(table_timings[application.id].value[:10]) == 'near' %} near{% endif %}" data-kind="{{ table_timings[application.id].kind }}">{% if table_timings[application.id].value %}<strong>{{ table_timings[application.id].label }}</strong><small>{{ friendly_datetime(table_timings[application.id].value) }}</small>{% else %}—{% endif %}</td>
           <td><details class="table-action-menu"><summary aria-label="查看操作">⋯</summary><a href="/progress?view=list&focus={{ application.id }}">查看与操作</a></details></td>
         </tr>
       {% else %}

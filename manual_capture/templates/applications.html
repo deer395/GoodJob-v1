@@ -37,7 +37,7 @@
 
     <div class="job-list">
       {% for app in (sent if tab == 'sent' else pending) %}
-      <article class="job {% if focus == app.id %}focused{% endif %}">
+      <article class="job {% if focus == app.id %}focused{% endif %}{% if app.status == '待投递' %} {{ 'ddl-expired' if deadline_state(app.deadline) == 'expired' else 'ddl-near' if deadline_state(app.deadline) == 'near' else 'ddl-ok' }}{% endif %}">
         <div>
           <h2>{{ app.company }} · {{ app.title }} · {{ app.city }}</h2>
           {% if app.status == '待投递' %}
@@ -87,9 +87,9 @@
       <h2>手动记录已投递</h2>
       <p>用于在 BOSS、官网或其他渠道已经完成投递的岗位。</p>
       {% if manual_event %}<div class="alert warning">此操作会手动创建一条“已投递”申请，并明确关联邮件《{{ manual_event.subject }}》。已从邮件预填的信息仍需你核对；候选行动截止不会写入岗位投递 DDL，而是在保存后作为该邮件事件的关键时间。</div><input type="hidden" name="email_event_id" value="{{ manual_event.id }}"><input type="hidden" name="return_to" value="email">{% endif %}
-      <label>公司名 *<input name="company" value="{{ manual_event.extracted_company if manual_event else '' }}" required></label>
-      <label>岗位名 *<input name="title" value="{{ manual_event.extracted_title if manual_event else '' }}" required></label>
-      <label>工作地点 *<input name="city" value="{{ manual_event.extracted_city if manual_event else '' }}" required></label>
+      <label>公司名 <span class="field-required">*</span><input name="company" value="{{ manual_event.extracted_company if manual_event else '' }}" required></label>
+      <label>岗位名 <span class="field-required">*</span><input name="title" value="{{ manual_event.extracted_title if manual_event else '' }}" required></label>
+      <label>工作地点 <span class="field-required">*</span><input name="city" value="{{ manual_event.extracted_city if manual_event else '' }}" required></label>
       <label>来源
         <select name="source"><option>其他</option><option>官网</option><option>BOSS直聘</option><option>牛客</option><option>公众号</option></select>
       </label>
