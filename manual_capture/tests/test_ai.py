@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 
 from manual_capture.ai import AIUnavailable, ExtractionResult, OpenAIClient, SemanticResult
 from manual_capture.app import create_app, should_auto_apply_email
-from manual_capture.email_processing import PARSER_VERSION
+from manual_capture.email_processing import EmailProposal, EmailUnderstanding, PARSER_VERSION
 
 
 def test_missing_ai_config_keeps_manual_capture_available(tmp_path, monkeypatch):
@@ -45,6 +45,79 @@ def test_email_parser_uses_ascii_wire_category(monkeypatch):
     monkeypatch.setattr(client, "_call", lambda *_: {"category": "exam", "company": "示例公司", "title": None, "scheduled_date": None, "action_deadline": "2026-08-12T20:00", "summary": "请在指定时间内完成在线测评并注意浏览器兼容性", "confidence": 88.4})
     parsed = client.parse_email({"subject": "测评邀请", "sender_domain": "example.com", "snippet": "请完成测评"})
     assert parsed.category == "笔试" and parsed.confidence == 88 and parsed.scheduled_date == "" and parsed.action_deadline == "2026-08-12T20:00" and len(parsed.summary) <= 30
+
+
+def test_email_understanding_returns_cited_multiple_proposals(monkeypatch):
+    client = OpenAIClient()
+    monkeypatch.setattr(client, "_call", lambda *_: {"company": "星河科技", "title": "数据产品经理", "city": "上海", "proposals": [
+        {"kind": "阶段推进", "category": "笔试", "summary": "通过筛选进入测评", "suggested_action": "完成在线测评", "scheduled_date": "", "action_deadline": "", "confidence": 90, "evidence_ids": [1]},
+        {"kind": "行动截止", "category": "笔试", "summary": "测评截止", "suggested_action": "在截止前完成测评", "scheduled_date": "", "action_deadline": "2026-08-18T20:00", "confidence": 95, "evidence_ids": [2]},
+    ]})
+    parsed = client.understand_email({"subject": "测评邀请", "sender_domain": "example.com", "evidence": [{"id": 1, "text": "通过筛选"}, {"id": 2, "text": "2026-08-18 20:00 前完成"}]})
+    assert len(parsed.proposals) == 2 and parsed.proposals[1].action_deadline == "2026-08-18T20:00"
+
+
+def test_email_proposal_normalizes_space_separated_datetime_to_canonical_iso():
+    proposal = EmailProposal(kind="阶段推进", category="面试", summary="一面", confidence=90, evidence_ids=[1], scheduled_date="2026-08-18 10:30")
+    assert proposal.scheduled_date == "2026-08-18T10:30"
+
+
+def test_email_understanding_without_explicit_deadline_becomes_manual_reminder(tmp_path):
+    app = create_app(tmp_path / "email-reminder.db")
+    store = app.state.store
+    store.insert_email_event({"dedup_key": "reminder:1", "subject": "二面通知", "snippet": "暂无具体时间", "received_at": "2026-08-12T10:00:00"})
+    store.update_email_understanding(1, EmailUnderstanding(proposals=[EmailProposal(kind="行动截止", category="面试", summary="确认面试", suggested_action="确认参加", confidence=60, evidence_ids=[1])]), ["暂无具体时间"])
+    assert store.email_proposals(1)[0]["kind"] == "提醒"
+
+
+def test_interview_primary_proposal_keeps_explicit_location_and_reply_deadline_visible(tmp_path):
+    app = create_app(tmp_path / "email-location.db")
+    store = app.state.store
+    store.insert_email_event({"dedup_key": "location:1", "subject": "综合面试", "snippet": "面试通知", "received_at": "2026-08-12T10:00:00"})
+    store.update_email_understanding(1, EmailUnderstanding(proposals=[
+        EmailProposal(kind="阶段推进", category="面试", summary="综合面试", suggested_action="准备面试", location="北京市海淀区示例路1号", confidence=90, evidence_ids=[1]),
+        EmailProposal(kind="行动截止", category="面试", summary="回复确认", action_deadline="2026-08-19T17:00", confidence=90, evidence_ids=[1]),
+    ]), ["综合面试通知"])
+    primary = store.email_proposals(1)[0]
+    assert primary["location"] == "北京市海淀区示例路1号"
+    assert "地点：北京市海淀区示例路1号" in primary["suggested_action"]
+    assert "回复截止：2026-08-19T17:00" in primary["suggested_action"]
+
+
+def test_email_proposals_are_independently_confirmable_and_manual_kinds_do_not_change_status(tmp_path):
+    app = create_app(tmp_path / "proposal-flow.db")
+    store = app.state.store
+    job_id = store.create({"company": "星河科技", "title": "数据产品经理", "city": "上海", "source": "其他", "application_url": "", "salary_range": "", "department": "", "description_text": "", "deadline": "", "note": ""})
+    app_id = store.create_application(job_id)
+    assert store.confirm_application(app_id)
+    store.insert_email_event({"dedup_key": "proposal:1", "subject": "测评", "snippet": "通过筛选", "received_at": "2026-08-12T10:00:00"})
+    understanding = EmailUnderstanding(company="星河科技", title="数据产品经理", proposals=[
+        EmailProposal(kind="阶段推进", category="笔试", summary="通过筛选", confidence=90, evidence_ids=[1]),
+        EmailProposal(kind="行动截止", category="笔试", summary="测评截止", action_deadline="2026-08-18T20:00", confidence=95, evidence_ids=[1]),
+        EmailProposal(kind="改期取消", category="面试", summary="原面试取消", confidence=95, evidence_ids=[1]),
+    ])
+    store.update_email_understanding(1, understanding, ["通过筛选并请在截止前完成测评"])
+    proposals = store.email_proposals(1)
+    store.resolve_email_proposal(proposals[0]["id"], app_id, "完成测评")
+    assert store.application_by_id(app_id)["status"] == "测评/笔试"
+    store.resolve_email_proposal(proposals[1]["id"], app_id)
+    assert len(store.application_events(app_id)) == 3
+    try:
+        store.resolve_email_proposal(proposals[2]["id"], app_id)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("cancellation must remain manual")
+
+
+def test_email_page_renders_cited_proposals_and_manual_cancellation_boundary(tmp_path):
+    app = create_app(tmp_path / "proposal-page.db")
+    store = app.state.store
+    store.insert_email_event({"dedup_key": "proposal:page", "subject": "面试调整", "snippet": "原定面试取消", "received_at": "2026-08-12T10:00:00"})
+    store.update_email_understanding(1, EmailUnderstanding(proposals=[EmailProposal(kind="改期取消", category="面试", summary="原定面试取消", suggested_action="人工核对后更新安排", confidence=95, evidence_ids=[1])]), ["原定于 2026-08-20 的面试取消"])
+    page = TestClient(app).get("/progress?view=email")
+    assert "原定面试取消" in page.text and "人工核对后更新安排" in page.text
+    assert "不会自动改写既有事件或阶段" in page.text
 
 
 def test_email_sync_button_runs_one_local_agent_once(tmp_path, monkeypatch):

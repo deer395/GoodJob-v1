@@ -157,8 +157,11 @@ def test_initialize_upgrades_a_legacy_local_schema_through_alembic(tmp_path):
     with sqlite3.connect(legacy_path) as conn:
         revision = conn.execute("SELECT version_num FROM alembic_version").fetchone()[0]
         link_table = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='email_event_links'").fetchone()
-    assert revision == "20260812_phase3a_hybrid_screening"
-    assert link_table is not None
+        proposal_table = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='email_event_proposals'").fetchone()
+        proposal_columns = {row[1] for row in conn.execute("PRAGMA table_info(email_event_proposals)").fetchall()}
+    assert revision == "20260812_phase3b_email_location"
+    assert link_table is not None and proposal_table is not None
+    assert "location" in proposal_columns
     assert upgraded.get(999) is None
 
 
@@ -382,12 +385,12 @@ def test_email_key_times_require_separate_explicit_confirmation(tmp_path):
     job_id = store.create({"company": "时间公司", "title": "产品经理", "city": "上海", "source": "其他", "application_url": "", "salary_range": "", "department": "", "description_text": "", "deadline": "2026-09-01", "note": ""})
     app_id = store.create_application(job_id)
     assert store.confirm_application(app_id)
-    assert store.insert_email_event({"dedup_key": "test:key-times", "subject": "在线测评", "snippet": "请完成测评", "received_at": "2026-08-09T10:00:00", "category": "笔试", "summary": "在线测评通知", "confidence": 70, "proposed_scheduled_at": "2026-08-12T14:00", "proposed_action_deadline_at": "2026-08-12T20:00"})
+    assert store.insert_email_event({"dedup_key": "test:key-times", "subject": "在线测评", "snippet": "请完成测评", "received_at": "2026-08-09T10:00:00", "category": "笔试", "summary": "在线测评通知", "confidence": 70, "proposed_scheduled_at": "2026-08-20T14:00", "proposed_action_deadline_at": "2026-08-20T20:00"})
 
     store.resolve_email_event(1, "confirmed", app_id, confirm_schedule=False, confirm_action_deadline=True)
     linked_event = next(item for item in store.application_events(app_id) if item["event_type"] == "笔试通知")
     assert linked_event["scheduled_at"] is None
-    assert linked_event["action_deadline_at"] == "2026-08-12T20:00"
+    assert linked_event["action_deadline_at"] == "2026-08-20T20:00"
     assert any(item["source"] == "action-deadline" for item in store.calendar_export_entries("future", date.today()))
 
 

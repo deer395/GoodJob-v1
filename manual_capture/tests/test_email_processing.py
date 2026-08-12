@@ -1,4 +1,4 @@
-from manual_capture.email_processing import candidate_subject, dedup_key, email_excerpt, local_email_parse, redact
+from manual_capture.email_processing import candidate_email, candidate_subject, dedup_key, email_evidence, email_excerpt, local_email_parse, redact
 from manual_capture.imap_agent import local_api_url
 
 def test_local_filter_redaction_and_dedup():
@@ -29,3 +29,20 @@ def test_agent_api_url_uses_configurable_port(monkeypatch):
     assert local_api_url().endswith(':8000/api/email-events')
     monkeypatch.setenv('FASTAPI_PORT', '8010')
     assert local_api_url().endswith(':8010/api/email-events')
+
+
+def test_body_signal_can_enter_candidate_queue_and_evidence_stays_redacted():
+    body = '您好，您已通过简历筛选。请于 2026-08-20 14:00 参加线上面试。联系 a@example.com，链接 https://x.example/a?token=secret'
+    assert candidate_email('关于您的申请', body)
+    evidence = email_evidence(body)
+    assert evidence and all('a@example.com' not in item and 'secret' not in item for item in evidence)
+
+
+def test_email_evidence_keeps_numbered_notice_heading_with_its_value():
+    body = '中国船舶集团有限公司系统工程研究院2027年度校园招聘。\n经审核通知参加综合面试。\n一、面试时间\n2026年8月22日上午09:00\n二、面试地点\n北京市海淀区示例路1号\n三、应聘岗位\n系统工程/数据分析方向\n五、请携带以下材料\n身份证原件；学生证；个人简历3份；成绩单\n请于2026年8月19日17:00前回复确认参加。'
+    evidence = email_evidence(body)
+    assert any('面试时间：2026年8月22日上午09:00' in item for item in evidence)
+    assert any('面试地点：北京市海淀区示例路1号' in item for item in evidence)
+    assert any('应聘岗位：系统工程/数据分析方向' in item for item in evidence)
+    assert any('身份证原件；学生证；个人简历3份；成绩单' in item for item in evidence)
+    assert any('中国船舶集团' in item for item in evidence)

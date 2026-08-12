@@ -163,3 +163,18 @@ input:focus,select:focus,textarea:focus{
 /* Self-diagnosis fixes (R2): previously-unstyled semantic helpers */
 .empty{padding:40px 20px;text-align:center;color:var(--gw-gray-500);font-size:14px;background:#fff;border:1px dashed var(--gw-gray-200);border-radius:var(--gw-radius-lg)}
 .field-hint{display:block;color:var(--gw-gray-500);font-size:12px;font-weight:500;margin:4px 0 0;line-height:1.5}
+
+/* Email confirmation: lead with one product-level action, disclose evidence on demand. */
+.email-event-card .email-event-actions{border-top:0;margin-top:12px;padding-top:0}
+.email-action-summary{padding:14px 16px;background:#f7fbff;border:1px solid #d9e8f8;border-radius:8px}
+.email-action-summary p{color:#334155;margin:5px 0}
+.email-action-summary .email-outcome{font-size:16px;font-weight:750;color:#173e70;margin-top:0}
+.email-primary-plan{margin:14px 0 0}
+.email-evidence-details{margin-top:12px;border-top:1px solid #e0e8f2;padding-top:10px}
+.email-evidence-details>summary{cursor:pointer;color:#155da8;font-weight:700;font-size:13px}
+.email-source-snippet{margin:12px 0!important;color:var(--muted)!important;line-height:1.65}
+.email-proposal{padding:12px 0;border-top:1px solid #edf2f7}
+.email-proposal:first-of-type{border-top:0}
+.email-proposal blockquote{margin:9px 0;padding:8px 11px;border-left:3px solid #bed9f5;background:#f8fbfe;color:#475569;font-size:13px;line-height:1.55}
+.email-detail-plan{margin-top:10px;padding:12px}
+@media(max-width:700px){.email-action-summary{padding:13px}.email-primary-plan,.email-detail-plan{grid-template-columns:1fr}}

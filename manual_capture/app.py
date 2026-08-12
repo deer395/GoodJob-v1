@@ -25,7 +25,7 @@ from .matching import canonical_tags, configured, evaluate
 from .calendar_routes import create_calendar_router
 from .import_routes import create_import_router
 from .ai import AIUnavailable, EXTRACTION_PROMPT_VERSION, SEMANTIC_PROMPT_VERSION, OpenAIClient, config as ai_config, fingerprint
-from .email_processing import PARSER_VERSION, local_email_parse
+from .email_processing import PARSER_VERSION, EmailProposal, EmailUnderstanding, local_email_parse
 import os, secrets
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -120,7 +120,7 @@ class JobStore:
         required = {
             "job_postings", "candidate_profiles", "applications", "checklist_items",
             "application_events", "import_batches", "ai_settings", "email_dedup",
-            "email_events", "email_event_links", "email_sync_diagnostics", "job_ai_analyses", "alembic_version",
+            "email_events", "email_event_links", "email_event_proposals", "email_sync_diagnostics", "job_ai_analyses", "alembic_version",
         }
         with self.connection() as conn:
             tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -249,7 +249,35 @@ class JobStore:
             conn.execute("UPDATE ai_settings SET ai_enabled=?,enable_email_parsing=? WHERE id=1", (int(enabled), int(email_enabled)))
 
     def pending_email_events(self):
-        with self.connection() as conn: return conn.execute("SELECT * FROM email_events WHERE status IN ('pending','parse_failed') ORDER BY received_at DESC,id DESC").fetchall()
+            with self.connection() as conn: return conn.execute("SELECT * FROM email_events WHERE status IN ('pending','parse_failed') ORDER BY received_at DESC,id DESC").fetchall()
+
+    def email_proposals(self, event_id: int):
+        try:
+            with self.connection() as conn:
+                return conn.execute(
+                    "SELECT * FROM email_event_proposals WHERE email_event_id=? AND status='pending' "
+                    "ORDER BY CASE kind WHEN '阶段推进' THEN 0 WHEN '行动截止' THEN 1 WHEN '补充材料' THEN 2 WHEN '提醒' THEN 3 WHEN '改期取消' THEN 4 ELSE 5 END, id",
+                    (event_id,),
+                ).fetchall()
+        except sqlite3.OperationalError:
+            # A live pre-3B process may serve a request while its local database
+            # waits for the explicitly backed-up Alembic upgrade.  Keep the
+            # existing manual email queue readable; never fake proposal data.
+            return []
+
+    def insert_email_proposals(self, event_id: int, proposals: list[EmailProposal], evidence: list[str]) -> None:
+        stamp = datetime.now().isoformat(timespec="seconds")
+        with self.connection() as conn:
+            conn.execute("DELETE FROM email_event_proposals WHERE email_event_id=? AND status='pending'", (event_id,))
+            for proposal in proposals:
+                cited = [evidence[index - 1] for index in proposal.evidence_ids if isinstance(index, int) and 1 <= index <= len(evidence)]
+                if not cited:
+                    continue
+                conn.execute("INSERT INTO email_event_proposals(email_event_id,kind,category,summary,suggested_action,location,confidence,evidence_json,scheduled_at,action_deadline_at,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (event_id,proposal.kind,proposal.category,proposal.summary,proposal.suggested_action,proposal.location,proposal.confidence,json.dumps(cited,ensure_ascii=False),proposal.scheduled_date or None,proposal.action_deadline or None,'pending',stamp,stamp))
+
+    def proposal(self, proposal_id: int):
+        with self.connection() as conn:
+            return conn.execute("SELECT * FROM email_event_proposals WHERE id=?", (proposal_id,)).fetchone()
 
     def record_email_sync_diagnostic(self, *, started_at: str, finished_at: str, outcome: str,
                                      diagnostic_category: str, candidate_count: int | None = None,
@@ -285,6 +313,9 @@ class JobStore:
     def email_event(self, event_id: int):
         with self.connection() as conn: return conn.execute("SELECT * FROM email_events WHERE id=?", (event_id,)).fetchone()
 
+    def email_event_by_dedup_key(self, dedup_key: str):
+        with self.connection() as conn: return conn.execute("SELECT * FROM email_events WHERE dedup_key=?", (dedup_key,)).fetchone()
+
     def update_email_parse(self, event_id: int, parsed=None, error: str = "") -> None:
         stamp=datetime.now().isoformat(timespec="seconds")
         proposal=self.proposed_application(parsed.company, parsed.title) if parsed is not None else None
@@ -292,6 +323,40 @@ class JobStore:
             if parsed is None:
                 conn.execute("UPDATE email_events SET status='parse_failed',parse_error=?,updated_at=? WHERE id=?", (error[:80],stamp,event_id)); return
             conn.execute("UPDATE email_events SET category=?,summary=?,confidence=?,extracted_company=?,extracted_title=?,extracted_city=?,proposed_application_id=?,proposed_scheduled_at=?,proposed_action_deadline_at=?,status='pending',parse_error=NULL,updated_at=? WHERE id=?", (parsed.category,parsed.summary,parsed.confidence,parsed.company,parsed.title,parsed.city,proposal,parsed.scheduled_date or None,parsed.action_deadline or None,stamp,event_id))
+
+    def update_email_understanding(self, event_id: int, understanding: EmailUnderstanding, evidence: list[str]) -> None:
+        usable = []
+        for item in understanding.proposals:
+            if not any(isinstance(index, int) and 1 <= index <= len(evidence) for index in item.evidence_ids):
+                continue
+            # “行动截止” is a fact only when the evidence supplied a concrete
+            # deadline.  Without one it is merely a reminder and must not be
+            # displayed or confirmed as a deadline-driven workflow event.
+            if item.kind == "行动截止" and not item.action_deadline:
+                item = item.model_copy(update={"kind": "提醒"})
+            usable.append(item)
+        # Keep the compact first-screen card actionable without making users
+        # open technical evidence.  The underlying proposals remain separate
+        # and individually confirmable; this only repeats explicit location
+        # and reply-deadline facts in the stage proposal's visible next step.
+        deadline = next((item for item in usable if item.kind == "行动截止" and item.action_deadline), None)
+        for index, item in enumerate(usable):
+            if item.kind != "阶段推进" or not (item.location or deadline):
+                continue
+            details = []
+            if item.location:
+                details.append(f"地点：{item.location}")
+            if deadline:
+                details.append(f"回复截止：{deadline.action_deadline}")
+            action = item.suggested_action.strip()
+            suffix = "；".join(details)
+            usable[index] = item.model_copy(update={"suggested_action": (f"{action}；{suffix}" if action else suffix)[:120]})
+        primary = usable[0] if usable else EmailProposal(kind="其他", category="其他", confidence=0, summary="未识别到可确认的招聘事件", evidence_ids=[])
+        proposal = self.proposed_application(understanding.company, understanding.title)
+        stamp = datetime.now().isoformat(timespec="seconds")
+        with self.connection() as conn:
+            conn.execute("UPDATE email_events SET category=?,summary=?,confidence=?,extracted_company=?,extracted_title=?,extracted_city=?,proposed_application_id=?,proposed_scheduled_at=?,proposed_action_deadline_at=?,status='pending',parse_error=NULL,updated_at=? WHERE id=?", (primary.category,primary.summary[:30],primary.confidence,understanding.company,understanding.title,understanding.city,proposal,primary.scheduled_date or None,primary.action_deadline or None,stamp,event_id))
+        self.insert_email_proposals(event_id, usable, evidence)
 
     def proposed_application(self, company: str, title: str):
         with self.connection() as conn:
@@ -355,6 +420,29 @@ class JobStore:
             conn.execute("UPDATE applications SET status=?,updated_at=? WHERE id=?",(status,stamp,app_id))
             conn.execute("UPDATE email_events SET category=?,status=?,proposed_application_id=?,linked_application_event_id=?,updated_at=? WHERE id=?",(category,'confirmed' if action=='confirmed' else 'auto_applied',app_id,cursor.lastrowid,stamp,event_id))
             conn.execute("INSERT INTO email_event_links(email_event_id,application_event_id,idempotency_key,created_at) VALUES(?,?,?,?)", (event_id, cursor.lastrowid, f"email-event:{event_id}", stamp))
+
+    def resolve_email_proposal(self, proposal_id: int, application_id: int, next_action: str = "") -> None:
+        with self.connection() as conn:
+            proposal = conn.execute("SELECT * FROM email_event_proposals WHERE id=?", (proposal_id,)).fetchone()
+            if not proposal or proposal["status"] != "pending":
+                raise ValueError("该候选事件已处理或不存在")
+            if proposal["kind"] not in {"阶段推进", "行动截止"}:
+                raise ValueError("该候选项需要人工核对，不会自动改写申请进度")
+            target = self._email_target(proposal["category"])
+            app = conn.execute("SELECT * FROM applications WHERE id=?", (application_id,)).fetchone()
+            if not target or not app:
+                raise ValueError("请选择有效申请")
+            status, event_type = target
+            if status not in ADVANCE_TARGETS.get(app["status"], ()):
+                raise ValueError("当前申请状态不允许由该候选事件推进")
+            stamp = datetime.now().isoformat(timespec="seconds")
+            cursor = conn.execute("INSERT INTO application_events(application_id,event_type,event_date,scheduled_at,action_deadline_at,description,created_at) VALUES(?,?,?,?,?,?,?)", (application_id,event_type,stamp[:10],proposal["scheduled_at"],proposal["action_deadline_at"],proposal["summary"] or "来自邮件候选事件",stamp))
+            conn.execute("UPDATE applications SET status=?,next_action=?,updated_at=? WHERE id=?", (status,next_action.strip() or app["next_action"],stamp,application_id))
+            conn.execute("UPDATE email_event_proposals SET status='confirmed',linked_application_event_id=?,updated_at=? WHERE id=?", (cursor.lastrowid,stamp,proposal_id))
+
+    def dismiss_email_proposal(self, proposal_id: int) -> None:
+        with self.connection() as conn:
+            conn.execute("UPDATE email_event_proposals SET status='dismissed',updated_at=? WHERE id=? AND status='pending'", (datetime.now().isoformat(timespec="seconds"),proposal_id))
 
     def link_email_to_manual_application(self, event_id: int, application_id: int) -> None:
         """Record an explicit user link without inventing a parsed stage/event."""
@@ -1023,6 +1111,7 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
     templates.env.globals["table_deadline"] = table_deadline
     templates.env.globals["table_deadline_class"] = table_deadline_class
     templates.env.globals["city_summary"] = city_summary
+    templates.env.filters["from_json"] = lambda value: json.loads(value or "[]")
 
     @app.middleware("http")
     async def product_navigation(request: Request, call_next):
@@ -1223,19 +1312,23 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
         if not agent_authorized(request): raise HTTPException(status_code=403, detail="forbidden")
         payload=await request.json()
         required={"dedup_key","subject","snippet","received_at"}
-        if not required <= set(payload) or len(payload["snippet"]) > 200: raise HTTPException(status_code=422, detail="invalid event")
+        evidence = payload.get("evidence") or [payload.get("snippet", "")]
+        if not required <= set(payload) or len(payload["snippet"]) > 200 or not isinstance(evidence, list) or len(evidence) > 8 or any(not isinstance(item, str) or len(item) > 220 for item in evidence): raise HTTPException(status_code=422, detail="invalid event")
         store=request.app.state.store; settings=store.ai_settings()
-        # Repeated synchronizations must not trigger paid AI work for an already processed message.
-        if store.has_email_dedup(payload["dedup_key"]):
+        refresh_existing = payload.get("refresh_existing") is True
+        existing = store.email_event_by_dedup_key(payload["dedup_key"])
+        # Ordinary repeated syncs never trigger paid AI work. A user-requested
+        # refresh re-reads the same local IMAP message and replaces only its
+        # redacted proposal data; it never creates an Application.
+        if existing and not refresh_existing:
             return {"created": False}
+        understanding = None
         if settings['enable_email_parsing']:
             try:
-                parsed=request.app.state.ai_client.parse_email({'subject':payload['subject'],'sender_domain':payload.get('sender_domain',''),'snippet':payload['snippet']})
-                payload.update({'category':parsed.category,'summary':parsed.summary,'confidence':parsed.confidence,'company':parsed.company,'title':parsed.title,'city':parsed.city,'proposed_scheduled_at':parsed.scheduled_date or None,'proposed_action_deadline_at':parsed.action_deadline or None})
-                proposal=store.proposed_application(parsed.company,parsed.title); payload['proposed_application_id']=proposal
-                auto_application_id = should_auto_apply_email(payload, store)
-                if auto_application_id:
-                    payload.update({'proposed_application_id': auto_application_id, 'status': 'auto_applied'})
+                understanding=request.app.state.ai_client.understand_email({'subject':payload['subject'],'sender_domain':payload.get('sender_domain',''),'evidence':[{'id':index + 1,'text':item} for index,item in enumerate(evidence)]})
+                primary = understanding.proposals[0] if understanding.proposals else None
+                if primary:
+                    payload.update({'category':primary.category,'summary':primary.summary,'confidence':primary.confidence,'company':understanding.company,'title':understanding.title,'city':understanding.city,'proposed_scheduled_at':primary.scheduled_date or None,'proposed_action_deadline_at':primary.action_deadline or None})
             except AIUnavailable:
                 fallback = local_email_parse(payload["subject"], payload["snippet"])
                 if fallback:
@@ -1243,10 +1336,14 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
                 else:
                     # Do not retain provider details or model output; users only need an actionable safe reason.
                     payload.update({'status':'parse_failed','parse_error':'智能解析暂不可用，可稍后主动重新解析'})
+        if existing:
+            if understanding is not None:
+                store.update_email_understanding(existing["id"], understanding, evidence)
+            return {"created": False, "refreshed": True}
         created=store.insert_email_event(payload)
-        if created and payload.get('status')=='auto_applied':
+        if created and understanding is not None:
             with store.connection() as conn: row=conn.execute('SELECT id FROM email_events WHERE dedup_key=?',(payload['dedup_key'],)).fetchone()
-            if row: store.resolve_email_event(row['id'],'auto_applied')
+            if row: store.update_email_understanding(row['id'], understanding, evidence)
         return {"created": created}
 
     @app.get("/api/pending-events")
@@ -1254,7 +1351,7 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
         return [dict(row) for row in request.app.state.store.pending_email_events()]
 
     @app.post("/api/email-sync")
-    def sync_email_once(request: Request):
+    def sync_email_once(request: Request, refresh_existing: bool = Form(False)):
         """Run the local read-only Agent once, never as a background mailbox watcher."""
         started_at = datetime.now().isoformat(timespec="seconds")
         parser_enabled = bool(request.app.state.store.ai_settings()["enable_email_parsing"])
@@ -1266,7 +1363,7 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
             return RedirectResponse("/progress?view=email&message=邮箱同步正在进行，请勿重复点击", status_code=303)
         try:
             result = subprocess.run(
-                [sys.executable, str(BASE_DIR / "imap_agent.py"), "--once"],
+                [sys.executable, str(BASE_DIR / "imap_agent.py"), "--once", *( ["--refresh-existing"] if refresh_existing else [])],
                 cwd=str(BASE_DIR.parent), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90,
                 env={**os.environ, "FASTAPI_PORT": str(request.url.port or 8000)},
             )
@@ -1293,7 +1390,11 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
                     diagnostic_category="none", candidate_count=candidate_count, created_count=created_count,
                     deduplicated_count=deduplicated_count, parser_enabled=parser_enabled,
                 )
-                message = f"同步完成：检查到 {candidate_count} 封候选邮件；按 INBOX、近 7 天、最多 50 封扫描，新增 {created_count} 封，去重 {deduplicated_count} 封。"
+                refreshed_count = diagnostics.get("refreshed_count", 0) if isinstance(diagnostics, dict) else 0
+                detail = f"新增 {created_count} 封，去重 {deduplicated_count} 封"
+                if refresh_existing:
+                    detail += f"，刷新解析 {refreshed_count} 封"
+                message = f"同步完成：检查到 {candidate_count} 封候选邮件；按 INBOX、近 7 天、最多 50 封扫描，{detail}。"
             else:
                 output = (result.stdout or "") + "\n" + (result.stderr or "")
                 category = "not_configured" if result.returncode == 2 else "authentication_or_permission" if "auth" in output.lower() or "login" in output.lower() else "connection" if "connect" in output.lower() else "agent_unavailable"
@@ -1344,18 +1445,38 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
     def dismiss_pending_event(request: Request,event_id:int):
         request.app.state.store.resolve_email_event(event_id,'dismissed'); return RedirectResponse('/progress?message=邮件事件已驳回',303)
 
+    @app.post('/api/email-proposals/{proposal_id}/confirm')
+    def confirm_email_proposal(request: Request, proposal_id: int, application_id: int = Form(...), next_action: str = Form("")):
+        try:
+            request.app.state.store.resolve_email_proposal(proposal_id, application_id, next_action)
+            message = '候选事件已确认，申请进度已更新'
+        except ValueError as error:
+            message = str(error)
+        return RedirectResponse('/progress?view=email&message=' + message, 303)
+
+    @app.post('/api/email-proposals/{proposal_id}/dismiss')
+    def dismiss_email_proposal(request: Request, proposal_id: int):
+        request.app.state.store.dismiss_email_proposal(proposal_id)
+        return RedirectResponse('/progress?view=email&message=候选事件已驳回', 303)
+
     @app.post('/api/pending-events/{event_id}/reparse')
     def reparse_email_event(request: Request, event_id: int):
         store=request.app.state.store; event=store.email_event(event_id); settings=store.ai_settings()
         if not event or event['status'] not in {'pending', 'parse_failed'} or not settings['enable_email_parsing']:
             return RedirectResponse('/progress?view=email&message=当前邮件无法重新解析',303)
         try:
-            parsed=request.app.state.ai_client.parse_email({'subject':event['subject'],'sender_domain':event['sender_domain'] or '', 'snippet':event['snippet']})
-            store.update_email_parse(event_id, parsed)
-            found = []
-            if parsed.scheduled_date: found.append(f"候选安排时间 {parsed.scheduled_date}")
-            if parsed.action_deadline: found.append(f"候选行动截止 {parsed.action_deadline}")
-            message = '邮件已重新解析：' + ('；'.join(found) if found else '未识别到可确认的关键时间，请手动补记')
+            client = request.app.state.ai_client
+            if hasattr(client, 'understand_email'):
+                understanding = client.understand_email({'subject':event['subject'],'sender_domain':event['sender_domain'] or '', 'evidence':[{'id':1,'text':event['snippet']}]})
+                store.update_email_understanding(event_id, understanding, [event['snippet']])
+                message = '邮件已重新解析：识别到 ' + str(len(understanding.proposals)) + ' 个候选事项，请逐项确认'
+            else:
+                parsed=client.parse_email({'subject':event['subject'],'sender_domain':event['sender_domain'] or '', 'snippet':event['snippet']})
+                store.update_email_parse(event_id, parsed)
+                found = []
+                if parsed.scheduled_date: found.append(f"候选安排时间 {parsed.scheduled_date}")
+                if parsed.action_deadline: found.append(f"候选行动截止 {parsed.action_deadline}")
+                message = '邮件已重新解析：' + ('；'.join(found) if found else '未识别到可确认的关键时间，请手动补记')
         except AIUnavailable:
             fallback = local_email_parse(event['subject'], event['snippet'])
             if fallback:
@@ -1525,6 +1646,7 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
             "previous_month": previous_month,
             "following_month": following_month,
             "pending_email_events": store.pending_email_events(), "all_applications": store.list_progress_applications(),
+            "email_proposals": {event["id"]: store.email_proposals(event["id"]) for event in store.pending_email_events()} if view == "email" else {},
             "email_sync_diagnostic": store.latest_email_sync_diagnostic(),
         }
         template = "calendar.html" if view == "calendar" else "progress.html"

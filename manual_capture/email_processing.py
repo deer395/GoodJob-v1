@@ -7,10 +7,19 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 PARSER_VERSION = "email-v2"
 CANDIDATE_WORDS = ("笔试", "面试", "测评", "offer", "拒信", "感谢投递", "面试邀请", "笔试通知", "在线测评", "录用通知", "遗憾", "下一步", "通知")
 EXCLUDED_WORDS = ("宣讲", "竞赛", "内推", "推荐有礼")
+BODY_CANDIDATE_WORDS = CANDIDATE_WORDS + ("简历筛选", "材料", "改期", "取消", "回复", "申请进度")
 
 def candidate_subject(subject: str) -> bool:
     text = subject.lower()
     return any(word.lower() in text for word in CANDIDATE_WORDS) and not any(word in text for word in EXCLUDED_WORDS)
+
+
+def candidate_email(subject: str, body: str) -> bool:
+    """Local recall gate.  It never persists the body and excludes obvious campaigns."""
+    joined = f"{subject}\n{body}".lower()
+    return any(word.lower() in joined for word in BODY_CANDIDATE_WORDS) and not (
+        any(word in subject.lower() for word in EXCLUDED_WORDS) and not any(word.lower() in body.lower() for word in ("面试", "笔试", "测评", "offer"))
+    )
 
 def _redact(value: str) -> str:
     value = re.sub(r"[\w.+-]+@[\w.-]+", "[邮箱]", value)
@@ -33,6 +42,44 @@ def email_excerpt(value: str) -> str:
     if chunks:
         selected.insert(0, chunks[0])
     return _redact("。".join(dict.fromkeys(selected)))[:200]
+
+
+def email_evidence(value: str, limit: int = 8) -> list[str]:
+    """Return short, locally-redacted evidence sentences for optional AI parsing."""
+    chunks = [chunk.strip() for chunk in re.split(r"[\r\n。！？;；]+", value) if chunk.strip()]
+    # Long recruiting notices often put a numbered heading on one line and
+    # its value on the next. Keep that pair together: otherwise an
+    # evidence-only model sees “面试时间” but never receives the date.
+    heading = re.compile(r"^(?:[一二三四五六七八九十]+[、.．])?\s*(?:面试时间|面试地点|应聘岗位|现场签到|请携带以下材料|材料要求)\s*[:：]?$")
+    units: list[str] = []
+    index = 0
+    while index < len(chunks):
+        if heading.match(chunks[index]) and index + 1 < len(chunks):
+            if "材料" in chunks[index]:
+                # Semicolon-separated material lists are split above. Keep a
+                # bounded run together until a new numbered section or a
+                # separate reply/deadline instruction begins.
+                values = [chunks[index]]
+                next_index = index + 1
+                while next_index < len(chunks) and len(values) < 7:
+                    candidate = chunks[next_index]
+                    if heading.match(candidate) or candidate.startswith("请于") or candidate.startswith("如有"):
+                        break
+                    values.append(candidate)
+                    next_index += 1
+                units.append("：".join((values[0], "；".join(values[1:]))))
+                index = next_index
+            else:
+                units.append(f"{chunks[index]}：{chunks[index + 1]}")
+                index += 2
+        else:
+            units.append(chunks[index])
+            index += 1
+    keywords = ("截止", "完成", "测评", "笔试", "面试", "offer", "录用", "遗憾", "取消", "改期", "材料", "回复", "筛选", "岗位", "地点", "签到")
+    relevant = [chunk for chunk in units if any(word.lower() in chunk.lower() for word in keywords)]
+    company_context = [chunk for chunk in units[:3] if any(word in chunk for word in ("公司", "集团", "研究院", "招聘"))]
+    selected = list(dict.fromkeys(company_context + relevant))[:limit] or units[:limit]
+    return [_redact(chunk)[:220] for chunk in selected if _redact(chunk).strip()]
 
 
 def explicit_key_times(value: str) -> tuple[str, str]:
@@ -75,13 +122,12 @@ class EmailParse(BaseModel):
         if not value:
             return ""
         try:
-            datetime.fromisoformat(value)
+            return datetime.fromisoformat(value).isoformat(timespec="minutes")
         except ValueError:
             try:
-                date.fromisoformat(value)
+                return date.fromisoformat(value).isoformat()
             except ValueError as exc:
                 raise ValueError("key time must use ISO date or datetime") from exc
-        return value
 
 
 def local_email_parse(subject: str, snippet: str) -> EmailParse | None:
@@ -105,3 +151,29 @@ def local_email_parse(subject: str, snippet: str) -> EmailParse | None:
         if any(word in text for word in words):
             return EmailParse(category=category, company=company, title=title, city=city, summary=summary, confidence=45, scheduled_date=scheduled, action_deadline=action_deadline)
     return None
+
+
+class EmailProposal(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: str = Field(pattern="^(阶段推进|行动截止|补充材料|提醒|改期取消|其他)$")
+    category: str = Field(pattern="^(面试|笔试|Offer|拒信|群发广告|其他)$")
+    summary: str = Field(default="", max_length=60)
+    suggested_action: str = Field(default="", max_length=120)
+    location: str = Field(default="", max_length=180)
+    scheduled_date: str = Field(default="", max_length=25)
+    action_deadline: str = Field(default="", max_length=25)
+    confidence: int = Field(ge=0, le=100)
+    evidence_ids: list[int] = Field(default_factory=list, max_length=4)
+
+    @field_validator("scheduled_date", "action_deadline")
+    @classmethod
+    def proposal_time_must_be_iso(cls, value: str) -> str:
+        return EmailParse.key_time_must_be_iso(value)
+
+
+class EmailUnderstanding(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    company: str = Field(default="", max_length=120)
+    title: str = Field(default="", max_length=160)
+    city: str = Field(default="", max_length=120)
+    proposals: list[EmailProposal] = Field(default_factory=list, max_length=3)
