@@ -460,6 +460,7 @@ class JobStore:
                 source=:source,note=:note,updated_at=:updated_at WHERE id=:id""",
                 {**data, "id": job_id, "updated_at": datetime.now().isoformat(timespec="seconds")},
             )
+        self.recompute_matches()
 
     def delete(self, job_id: int) -> None:
         with self.connection() as conn:
@@ -998,7 +999,7 @@ def should_auto_apply_email(payload: dict, store: JobStore) -> int | None:
 def semantic_payload(job: dict, profile: dict) -> dict:
     """Minimum allowlist for direction/skill matching; school is intentionally excluded."""
     return {
-        "job": {key: str(job.get(key) or "")[:4000] for key in ("title", "city", "department", "description_text", "note")},
+        "job": {key: str(job.get(key) or "")[:4000] for key in ("company", "title", "city", "department", "description_text", "note")},
         "candidate": {key: str(profile.get(key) or "")[:500] for key in ("graduation_year", "degree", "major", "target_cities", "target_directions", "skills")},
     }
 

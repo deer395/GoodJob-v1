@@ -157,7 +157,7 @@ def test_initialize_upgrades_a_legacy_local_schema_through_alembic(tmp_path):
     with sqlite3.connect(legacy_path) as conn:
         revision = conn.execute("SELECT version_num FROM alembic_version").fetchone()[0]
         link_table = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='email_event_links'").fetchone()
-    assert revision == "20260809_email_sync_diagnostics"
+    assert revision == "20260812_phase3a_hybrid_screening"
     assert link_table is not None
     assert upgraded.get(999) is None
 
