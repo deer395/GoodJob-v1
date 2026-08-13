@@ -4,21 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>GoodJobAI · 投递工作台</title>
-  <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', path='app.css?v=20260814r8') }}">
 </head>
-<body>
-  <header>
-    <div class="brand">GoodJobAI</div>
-    <nav>
-      <a href="/">手动收录岗位</a>
-      <a href="/jobs">秋招雷达</a>
-      <a class="active" href="/applications">投递工作台</a>
-      <a href="/progress">申请进度</a>
-      <a href="/profile">求职画像</a>
-      <a href="/ai-settings">AI 设置</a>
-    </nav>
-  </header>
-  <main>
+<body><div class="app-shell"><aside class="app-sidebar"><div class="app-brand">GoodJobAI<small>秋招投递管理</small><span class="app-brand-badge">2027 秋招 · 本地工作区</span></div><nav><div class="nav-group"><div class="nav-group-label">总览</div><a class="nav-disabled" aria-disabled="true"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.5" y="1.5" width="5.5" height="5.5" rx="1"/><rect x="9" y="1.5" width="5.5" height="5.5" rx="1"/><rect x="1.5" y="9" width="5.5" height="5.5" rx="1"/><rect x="9" y="9" width="5.5" height="5.5" rx="1"/></svg>总览</a></div><div class="nav-group"><div class="nav-group-label">岗位管理</div><a href="/jobs"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6"/><circle cx="8" cy="8" r="2.5"/><path d="M8 8L13 4"/></svg>秋招雷达</a><a href="/"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.5" y="1.5" width="13" height="13" rx="2.5"/><path d="M8 4.5v7M4.5 8h7"/></svg>收录岗位</a><a class="active" href="/applications"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2L7 9M14 2l-5.5 12L6 9 2.5 7z"/></svg>投递工作台</a></div><div class="nav-group"><div class="nav-group-label">投递管理</div><a href="/progress"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 4h12M2 8h12M2 12h7"/></svg>申请进度</a><a href="/progress?view=email"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.5" y="3" width="13" height="10" rx="2"/><path d="M2.5 4l5.5 4.5L13.5 4"/></svg>邮件待确认</a></div><div class="nav-group"><div class="nav-group-label">个人配置</div><a href="/profile"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="5" r="3"/><path d="M2.5 14c0-2.8 2.5-4.5 5.5-4.5s5.5 1.7 5.5 4.5"/></svg>求职画像</a><a href="/ai-settings"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 2l1.3 3.7L13 7l-3.7 1.3L8 12l-1.3-3.7L3 7l3.7-1.3z"/></svg>AI 设置</a></div><div class="nav-group"><div class="nav-group-label">数据与备份</div><a href="/data-management"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><ellipse cx="8" cy="3.5" rx="5.5" ry="2"/><path d="M2.5 3.5v9c0 1.1 2.5 2 5.5 2s5.5-.9 5.5-2v-9"/><path d="M2.5 8c0 1.1 2.5 2 5.5 2s5.5-.9 5.5-2"/></svg>数据管理</a></div></nav><div class="app-sidebar-footer"><strong>Local</strong>数据仅保存在本机</div></aside><main class="app-main">
     <div class="heading">
       <div>
         <p class="eyebrow">投递管理</p>
@@ -29,6 +17,9 @@
     </div>
 
     {% if message %}<div class="alert success">{{ message }}</div>{% endif %}
+    {% set ns = namespace(near=0) %}{% for p in pending %}{% if deadline_state(p.deadline) == 'near' %}{% set ns.near = ns.near + 1 %}{% endif %}{% endfor %}
+
+    <div class="kpi-row"><div class="kpi-item"><strong>{{ pending|length }}</strong><span>待投递</span></div><div class="kpi-item"><strong>{{ ns.near }}</strong><span>临期</span></div><div class="kpi-item"><strong>{{ sent|length }}</strong><span>已投递</span></div></div>
 
     <div class="filter-tabs workspace-tabs">
       <a class="filter-tab {% if tab != 'sent' %}selected{% endif %}" href="/applications">待投递（{{ pending|length }}）</a>
@@ -38,16 +29,14 @@
     <div class="job-list">
       {% for app in (sent if tab == 'sent' else pending) %}
       <article class="job {% if focus == app.id %}focused{% endif %}{% if app.status == '待投递' %} {{ 'ddl-expired' if deadline_state(app.deadline) == 'expired' else 'ddl-near' if deadline_state(app.deadline) == 'near' else 'ddl-ok' }}{% endif %}">
-        <div>
-          <h2>{{ app.company }} · {{ app.title }} · {{ app.city }}</h2>
+        <div class="job-content">
+          <h2>{{ app.company }} · {{ app.title }}</h2>
+          <p class="job-sub">{{ app.city }} · {{ app.source }}{% if app.status == '已投递' %} · 投递于 {{ app.applied_at or '未记录' }}{% endif %}</p>
           {% if app.status == '待投递' %}
-          <p class="deadline {{ deadline_state(app.deadline) or '' }}">DDL：{{ deadline_countdown(app.deadline) }}{% if app.deadline %}（{{ app.deadline }}）{% endif %}</p>
-          <p>来源：{{ app.source }}</p>
-          {% else %}
-          <p>投递时间：{{ app.applied_at or '未记录' }}</p>
-          <p>来源：{{ app.source }}</p>
+          <p class="deadline {{ deadline_state(app.deadline) or '' }}">DDL：{{ deadline_countdown(app.deadline) }}{% if app.deadline %}（{{ app.deadline }}）{% endif %}{% if app.application_url %} · <a href="{{ app.application_url }}" target="_blank" rel="noopener" class="job-link">打开投递入口 ↗</a>{% endif %}</p>
+          {% elif app.application_url %}
+          <p><a href="{{ app.application_url }}" target="_blank" rel="noopener" class="job-link">打开投递入口 ↗</a></p>
           {% endif %}
-          {% if app.application_url %}<p><a href="{{ app.application_url }}" target="_blank" rel="noopener">打开投递链接 ↗</a></p>{% endif %}
         </div>
         <div class="job-actions">
           {% if app.status == '待投递' %}
@@ -99,6 +88,7 @@
       <button type="submit">{% if manual_event %}保存并关联此邮件{% else %}保存为已投递{% endif %}</button>
     </form>
   </dialog>
+</main></div>
 </body>
 </html>
 {% if manual_event %}<script>window.addEventListener('DOMContentLoaded',function(){document.getElementById('manual').showModal()})</script>{% endif %}

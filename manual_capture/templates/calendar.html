@@ -1,13 +1,11 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GoodJobAI · 申请进度日历</title><link rel="stylesheet" href="{{ url_for('static', path='app.css') }}?v=email-manual-20260809-1"></head>
-<body>
-<header><div class="brand">GoodJobAI</div><nav><a href="/">手动收录岗位</a><a href="/jobs">秋招雷达</a><a href="/applications">投递工作台</a><a class="active" href="/progress">申请进度</a><a href="/profile">求职画像</a><a href="/ai-settings">AI 设置</a></nav></header>
-<main>
-  <div class="heading"><div><p class="eyebrow">投递后管理</p><h1>申请进度</h1><p>在日历中查看本周与本月的申请关键时间。</p></div></div>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GoodJobAI · 申请进度日历</title><link rel="stylesheet" href="{{ url_for('static', path='app.css?v=20260814r8') }}?v=email-manual-20260809-1"></head>
+<body><div class="app-shell"><aside class="app-sidebar"><div class="app-brand">GoodJobAI<small>秋招投递管理</small><span class="app-brand-badge">2027 秋招 · 本地工作区</span></div><nav><div class="nav-group"><div class="nav-group-label">总览</div><a class="nav-disabled" aria-disabled="true"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.5" y="1.5" width="5.5" height="5.5" rx="1"/><rect x="9" y="1.5" width="5.5" height="5.5" rx="1"/><rect x="1.5" y="9" width="5.5" height="5.5" rx="1"/><rect x="9" y="9" width="5.5" height="5.5" rx="1"/></svg>总览</a></div><div class="nav-group"><div class="nav-group-label">岗位管理</div><a href="/jobs"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6"/><circle cx="8" cy="8" r="2.5"/><path d="M8 8L13 4"/></svg>秋招雷达</a><a href="/"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.5" y="1.5" width="13" height="13" rx="2.5"/><path d="M8 4.5v7M4.5 8h7"/></svg>收录岗位</a><a href="/applications"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2L7 9M14 2l-5.5 12L6 9 2.5 7z"/></svg>投递工作台</a></div><div class="nav-group"><div class="nav-group-label">投递管理</div><a class="active" href="/progress"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 4h12M2 8h12M2 12h7"/></svg>申请进度</a><a href="/progress?view=email"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.5" y="3" width="13" height="10" rx="2"/><path d="M2.5 4l5.5 4.5L13.5 4"/></svg>邮件待确认</a></div><div class="nav-group"><div class="nav-group-label">个人配置</div><a href="/profile"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="5" r="3"/><path d="M2.5 14c0-2.8 2.5-4.5 5.5-4.5s5.5 1.7 5.5 4.5"/></svg>求职画像</a><a href="/ai-settings"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 2l1.3 3.7L13 7l-3.7 1.3L8 12l-1.3-3.7L3 7l3.7-1.3z"/></svg>AI 设置</a></div><div class="nav-group"><div class="nav-group-label">数据与备份</div><a href="/data-management"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><ellipse cx="8" cy="3.5" rx="5.5" ry="2"/><path d="M2.5 3.5v9c0 1.1 2.5 2 5.5 2s5.5-.9 5.5-2v-9"/><path d="M2.5 8c0 1.1 2.5 2 5.5 2s5.5-.9 5.5-2"/></svg>数据管理</a></div></nav><div class="app-sidebar-footer"><strong>Local</strong>数据仅保存在本机</div></aside><main class="app-main">
+  <div class="heading"><div><p class="eyebrow">投递管理</p><h1>申请进度</h1><p>在日历中查看本周与本月的申请关键时间。</p></div></div>
   {% include "_progress_view_tabs.html" %}
   <section class="calendar-card">
-    <div class="calendar-head"><a class="secondary-link" href="/progress?view=calendar&year={{ previous_month.year }}&month={{ previous_month.month }}">上一月</a><h2>{{ calendar_year }} 年 {{ calendar_month }} 月</h2><a class="secondary-link" href="/progress?view=calendar&year={{ following_month.year }}&month={{ following_month.month }}">下一月</a></div>
+    <div class="calendar-head"><a class="secondary-link" href="/progress?view=calendar&year={{ previous_month.year }}&month={{ previous_month.month }}">‹ 上一月</a><h2>{{ calendar_year }} 年 {{ calendar_month }} 月</h2><a class="secondary-link" href="/progress?view=calendar&year={{ following_month.year }}&month={{ following_month.month }}">下一月 ›</a></div>
     <div class="calendar-legend"><span class="calendar-dot deadline-dot"></span>投递 DDL <span class="calendar-dot interview-dot"></span>面试/安排 <span class="calendar-dot assessment-dot"></span>测评/笔试 <span class="calendar-dot applied-dot"></span>已投递 <span class="calendar-dot next-action-dot"></span>行动截止/下一步</div>
     <div class="calendar-weekdays"><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span></div>
     <div class="calendar-grid">
@@ -16,6 +14,6 @@
       {% endfor %}
     </div>
   </section>
-</main>
+</main></div>
 </body>
 </html>

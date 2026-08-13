@@ -26,6 +26,23 @@
       article.appendChild(link);
     });
   }
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', detailDeleteControls);
-  else detailDeleteControls();
+
+  /* Reflect the current pathname onto the matching sidebar link.
+     The middleware at app.py:1116 injects <a href="/data-management">数据管理</a>
+     without an "active" class; this helper covers it and also lets long
+     child routes (e.g. /jobs/123/edit) light up their parent sidebar entry. */
+  function sidebarPageActive() {
+    var path = window.location.pathname;
+    document.querySelectorAll('.app-sidebar nav a').forEach(function (a) {
+      if (a.classList.contains('active')) return;
+      var href = a.getAttribute('href');
+      if (!href) return;
+      if (href === path) { a.classList.add('page-active'); return; }
+      if (href !== '/' && path.indexOf(href + '/') === 0) a.classList.add('page-active');
+    });
+  }
+
+  function bootstrap() { detailDeleteControls(); sidebarPageActive(); }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootstrap);
+  else bootstrap();
 }());
