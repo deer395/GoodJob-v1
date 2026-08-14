@@ -714,6 +714,135 @@ class JobStore:
                 for stage, event_types in groups.items()
             }
 
+    def overview(self, today: date | None = None) -> dict[str, object]:
+        """Read-only action summary for the recruitment overview page."""
+        today = today or date.today()
+        now = datetime.now().replace(second=0, microsecond=0)
+        schedule_types = (*STAGE_EVENT_TYPES["测评/笔试"], *STAGE_EVENT_TYPES["面试"])
+        with self.connection() as conn:
+            total_jobs = conn.execute("SELECT COUNT(*) FROM job_postings").fetchone()[0]
+            status_rows = conn.execute(
+                "SELECT status, COUNT(*) AS count FROM applications GROUP BY status"
+            ).fetchall()
+            pending_jobs = conn.execute(
+                """SELECT a.id AS application_id, j.company, j.title, j.deadline
+                   FROM applications a JOIN job_postings j ON j.id=a.job_id
+                   WHERE a.status='待投递' AND j.deadline IS NOT NULL AND j.deadline <> ''"""
+            ).fetchall()
+            next_actions = conn.execute(
+                """SELECT a.id AS application_id, a.next_action, a.next_action_due_at,
+                          j.company, j.title
+                   FROM applications a JOIN job_postings j ON j.id=a.job_id
+                   WHERE a.status <> '已结束'
+                     AND a.next_action_due_at IS NOT NULL AND a.next_action_due_at <> ''"""
+            ).fetchall()
+            events = conn.execute(
+                f"""SELECT e.application_id, e.event_type, e.scheduled_at, e.action_deadline_at,
+                           j.company, j.title
+                    FROM application_events e
+                    JOIN applications a ON a.id=e.application_id
+                    JOIN job_postings j ON j.id=a.job_id
+                    WHERE a.status <> '已结束'
+                      AND ((e.scheduled_at IS NOT NULL AND e.scheduled_at <> ''
+                            AND e.event_type IN ({','.join('?' for _ in schedule_types)}))
+                           OR (e.action_deadline_at IS NOT NULL AND e.action_deadline_at <> ''))""",
+                schedule_types,
+            ).fetchall()
+
+        counts = {row["status"]: row["count"] for row in status_rows}
+        kpis = {
+            "jobs": total_jobs,
+            "pending": counts.get("待投递", 0),
+            "active": sum(counts.get(status, 0) for status in ("已投递", "测评/笔试", "面试", "Offer")),
+            "offer": counts.get("Offer", 0),
+        }
+
+        def parse_time(value: str | None) -> datetime | None:
+            if not value:
+                return None
+            try:
+                return datetime.fromisoformat(value)
+            except ValueError:
+                return None
+
+        def item(*, when: str, kind: str, label: str, company: str, title: str, application_id: int,
+                 priority: int, action_url: str, action_label: str) -> dict[str, object] | None:
+            timestamp = parse_time(when)
+            if timestamp is None:
+                return None
+            return {
+                "when": when,
+                "timestamp": timestamp,
+                "kind": kind,
+                "label": label,
+                "company": company,
+                "title": title,
+                "application_id": application_id,
+                "priority": priority,
+                "action_url": action_url,
+                "action_label": action_label,
+                "overdue": timestamp < now,
+            }
+
+        action_items: list[dict[str, object]] = []
+        for row in pending_jobs:
+            candidate = item(
+                when=row["deadline"], kind="投递截止", label="投递截止", company=row["company"], title=row["title"],
+                application_id=row["application_id"], priority=0,
+                action_url="/applications", action_label="去投递",
+            )
+            if candidate:
+                action_items.append(candidate)
+        for row in next_actions:
+            candidate = item(
+                when=row["next_action_due_at"], kind="下一步", label=row["next_action"] or "下一步行动",
+                company=row["company"], title=row["title"], application_id=row["application_id"], priority=0,
+                action_url=f"/progress?view=list&focus={row['application_id']}", action_label="查看申请",
+            )
+            if candidate:
+                action_items.append(candidate)
+        upcoming: list[dict[str, object]] = []
+        for row in events:
+            if row["action_deadline_at"]:
+                candidate = item(
+                    when=row["action_deadline_at"], kind="行动截止", label="行动截止",
+                    company=row["company"], title=row["title"], application_id=row["application_id"], priority=0,
+                    action_url=f"/progress?view=list&focus={row['application_id']}", action_label="查看申请",
+                )
+                if candidate:
+                    action_items.append(candidate)
+                    if candidate["timestamp"] >= now:
+                        upcoming.append(candidate)
+            if row["scheduled_at"]:
+                candidate = item(
+                    when=row["scheduled_at"], kind=row["event_type"], label=f"{row['event_type']}安排",
+                    company=row["company"], title=row["title"], application_id=row["application_id"], priority=1,
+                    action_url=f"/progress?view=list&focus={row['application_id']}", action_label="查看申请",
+                )
+                if candidate:
+                    action_items.append(candidate)
+                    if candidate["timestamp"] >= now:
+                        upcoming.append(candidate)
+        for row in next_actions:
+            candidate = item(
+                when=row["next_action_due_at"], kind="下一步", label=row["next_action"] or "下一步行动",
+                company=row["company"], title=row["title"], application_id=row["application_id"], priority=2,
+                action_url=f"/progress?view=list&focus={row['application_id']}", action_label="查看申请",
+            )
+            if candidate and candidate["timestamp"] >= now:
+                upcoming.append(candidate)
+
+        def action_sort_key(entry: dict[str, object]) -> tuple[int, datetime, int, str]:
+            timestamp = entry["timestamp"]
+            assert isinstance(timestamp, datetime)
+            day_distance = (timestamp.date() - today).days
+            urgency = 0 if day_distance < 0 else 1 if day_distance == 0 else 2 if day_distance <= 3 else 3
+            return urgency, timestamp, int(entry["priority"]), str(entry["company"])
+
+        action_items.sort(key=action_sort_key)
+        upcoming.sort(key=lambda entry: (entry["timestamp"], entry["priority"], entry["company"]))
+        return {"kpis": kpis, "actions": action_items[:5], "upcoming": upcoming[:7], "funnel": self.funnel()}
+
     def progress_calendar(self, year: int, month: int) -> list[dict[str, object]]:
         """Build a local-only calendar projection from existing application data."""
         entries: dict[str, list[dict[str, str]]] = {}
@@ -1120,6 +1249,13 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
         if "text/html" not in response.headers.get("content-type", ""):
             return response
         body = b"".join([chunk async for chunk in response.body_iterator])
+        overview_link = (
+            '<a href="/overview"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">'
+            '<rect x="1.5" y="1.5" width="5.5" height="5.5" rx="1"/><rect x="9" y="1.5" width="5.5" height="5.5" rx="1"/>'
+            '<rect x="1.5" y="9" width="5.5" height="5.5" rx="1"/><rect x="9" y="9" width="5.5" height="5.5" rx="1"/>'
+            '</svg>总览</a>'
+        ).encode("utf-8")
+        body = re.sub(rb'<a class="nav-disabled" aria-disabled="true">.*?</a>', overview_link, body, count=1)
         if b"</nav>" in body and b'href="/data-management"' not in body:
             body = body.replace(b"</nav>", '<a href="/data-management">数据管理</a></nav>'.encode("utf-8"), 1)
         if b"</body>" in body and b"product_actions.js" not in body:
@@ -1151,6 +1287,19 @@ def create_app(db_path: Path | str | None = None) -> FastAPI:
             if job:
                 success = job
         return render_form(request, success=success)
+
+    @app.get("/overview")
+    def overview(request: Request):
+        summary = request.app.state.store.overview()
+        pending_email_count = len(request.app.state.store.pending_email_events())
+        if pending_email_count:
+            email_item = {
+                "kind": "邮件待确认", "label": f"{pending_email_count} 封招聘邮件等待确认",
+                "company": "邮件待确认", "title": "需要人工核对", "action_url": "/progress?view=email", "action_label": "处理邮件",
+                "overdue": False,
+            }
+            summary["actions"] = [*summary["actions"][:4], email_item]
+        return templates.TemplateResponse(request, "overview.html", {**summary, "pending_email_count": pending_email_count})
 
     @app.post("/ai/extract")
     def ai_extract(request: Request, jd_text: str = Form(""), confirm_consent: str = Form("")):

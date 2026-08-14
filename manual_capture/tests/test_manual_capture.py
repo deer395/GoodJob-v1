@@ -425,6 +425,50 @@ def test_progress_calendar_projects_confirmed_schedule_and_action_deadline(tmp_p
     assert "行动截止 · 日历关键节点 · 产品经理" in page.text
 
 
+def test_overview_uses_live_counts_actions_and_confirmed_upcoming_items(tmp_path):
+    test_client = client(tmp_path)
+    today = date.today()
+    test_client.post("/jobs", data=payload(company="待投递公司", deadline=(today - timedelta(days=1)).isoformat()))
+    test_client.post("/jobs", data=payload(company="下一步公司", deadline=(today + timedelta(days=20)).isoformat()))
+    test_client.post("/jobs", data=payload(company="测评公司", deadline=(today + timedelta(days=20)).isoformat()))
+    test_client.post("/jobs", data=payload(company="Offer 公司", deadline=(today + timedelta(days=20)).isoformat()))
+    store = test_client.app.state.store
+    for job_id in range(1, 5):
+        store.create_application(job_id)
+    assert store.confirm_application(2)
+    assert store.confirm_application(3)
+    assert store.confirm_application(4)
+    store.save_application(2, "", "准备材料", "", f"{today + timedelta(days=2)}T09:00")
+    store.advance_application(3, "测评/笔试", "笔试通知", today.isoformat(), scheduled_at=f"{today + timedelta(days=1)}T10:00", action_deadline_at=f"{today + timedelta(days=1)}T20:00")
+    store.advance_application(4, "Offer", "Offer", today.isoformat())
+    store.insert_email_event({"dedup_key": "overview:pending", "subject": "待确认", "snippet": "招聘邮件", "received_at": f"{today}T08:00"})
+
+    summary = store.overview(today)
+    assert summary["kpis"] == {"jobs": 4, "pending": 1, "active": 3, "offer": 1}
+    assert [item["kind"] for item in summary["upcoming"][:2]] == ["笔试通知", "行动截止"]
+    assert summary["funnel"] == {"已投递": 3, "测评/笔试": 1, "面试": 0, "Offer": 1}
+
+    page = test_client.get("/overview")
+    assert page.status_code == 200
+    assert "总览" in page.text and "岗位总数" in page.text and "4" in page.text
+    assert "待投递公司" in page.text and "已逾期" in page.text
+    assert "1 封招聘邮件等待确认" in page.text
+    assert 'href="/progress?view=calendar"' in page.text
+
+
+def test_overview_empty_state_and_navigation_do_not_break_existing_entry_points(tmp_path):
+    test_client = client(tmp_path)
+    overview = test_client.get("/overview")
+    assert overview.status_code == 200
+    assert "近期没有需要立即处理的事项" in overview.text
+    assert "近期暂无已确认安排" in overview.text
+    assert 'href="/overview"' in overview.text and 'class="active" href="/overview"' in overview.text
+    for route in ("/", "/jobs", "/applications", "/progress", "/progress?view=calendar", "/progress?view=email"):
+        response = test_client.get(route)
+        assert response.status_code == 200
+        assert 'href="/overview"' in response.text
+
+
 def test_xlsx_import_maps_dates_tracks_batch_and_preserves_protected_fields(tmp_path):
     from openpyxl import Workbook
 

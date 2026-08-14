@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GoodJobAI · 总览</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='app.css?v=20260814r8') }}">
+</head>
+<body><div class="app-shell"><aside class="app-sidebar"><div class="app-brand">GoodJobAI<small>秋招投递管理</small><span class="app-brand-badge">2027 秋招 · 本地工作区</span></div><nav><div class="nav-group"><div class="nav-group-label">总览</div><a class="active" href="/overview"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.5" y="1.5" width="5.5" height="5.5" rx="1"/><rect x="9" y="1.5" width="5.5" height="5.5" rx="1"/><rect x="1.5" y="9" width="5.5" height="5.5" rx="1"/><rect x="9" y="9" width="5.5" height="5.5" rx="1"/></svg>总览</a></div><div class="nav-group"><div class="nav-group-label">岗位管理</div><a href="/jobs">秋招雷达</a><a href="/">收录岗位</a><a href="/applications">投递工作台</a></div><div class="nav-group"><div class="nav-group-label">投递管理</div><a href="/progress">申请进度</a><a href="/progress?view=email">邮件待确认</a></div><div class="nav-group"><div class="nav-group-label">个人配置</div><a href="/profile">求职画像</a><a href="/ai-settings">AI 设置</a></div><div class="nav-group"><div class="nav-group-label">数据与备份</div><a href="/data-management">数据管理</a></div></nav><div class="app-sidebar-footer"><strong>Local</strong>数据仅保存在本机</div></aside><main class="app-main overview-page">
+  <div class="heading"><div><p class="eyebrow">行动首页</p><h1>总览</h1><p>查看当前秋招进度与近期需要处理的事项。</p></div></div>
+
+  <section class="kpi-row overview-kpi-row" aria-label="秋招概览">
+    <div class="kpi-item"><strong>{{ kpis.jobs }}</strong><span>岗位总数</span></div>
+    <div class="kpi-item"><strong>{{ kpis.pending }}</strong><span>待投递</span></div>
+    <div class="kpi-item"><strong>{{ kpis.active }}</strong><span>进行中</span></div>
+    <div class="kpi-item"><strong>{{ kpis.offer }}</strong><span>Offer</span></div>
+  </section>
+
+  <section class="overview-main-grid">
+    <section class="overview-card overview-actions"><div class="section-title"><h2>今日需要处理</h2>{% if pending_email_count %}<a href="/progress?view=email" class="overview-link">{{ pending_email_count }} 封招聘邮件等待确认 →</a>{% else %}<span>按行动紧急程度排序</span>{% endif %}</div>
+      <div class="overview-list">
+      {% for item in actions %}
+        <article class="overview-item"><div class="overview-item-main"><strong>{{ item.company }} · {{ item.title }}</strong><span class="badge {% if item.overdue %}expired{% else %}near{% endif %}">{% if item.overdue %}已逾期 · {% endif %}{{ item.kind }}{% if item.when %} · {{ friendly_datetime(item.when) }}{% endif %}</span></div><a href="{{ item.action_url }}" class="overview-link">{{ item.action_label }} →</a></article>
+      {% else %}
+        <div class="empty">近期没有需要立即处理的事项。</div>
+      {% endfor %}
+      </div>
+    </section>
+    <section class="overview-card"><div class="section-title"><h2>近期安排</h2><a href="/progress?view=calendar" class="overview-link">查看完整日历 →</a></div>
+      <div class="overview-list">
+      {% for item in upcoming %}
+        <a href="{{ item.action_url }}" class="overview-item overview-event"><time>{{ friendly_datetime(item.when) }}</time><span>{{ item.kind }} · {{ item.company }}</span><small>{{ item.title }}</small></a>
+      {% else %}
+        <div class="empty">近期暂无已确认安排。</div>
+      {% endfor %}
+      </div>
+    </section>
+  </section>
+
+  <section class="funnel-card overview-funnel"><div class="section-title"><h2>申请漏斗</h2><span>按曾到达阶段统计</span></div>
+    {% set applied = funnel['已投递'] %}
+    {% for stage in ['已投递','测评/笔试','面试','Offer'] %}
+      {% set count = funnel[stage] %}
+      <div class="funnel-row"><span>{{ stage }}</span><div class="funnel-track"><span class="funnel-bar" style="width: {{ (count * 100 / applied) if applied else 0 }}%"></span></div><strong>{{ count }}</strong><em>{% if applied %}{{ ((count * 100 / applied)|round|int) }}%{% else %}—{% endif %}</em></div>
+    {% endfor %}
+  </section>
+</main></div></body>
+</html>
