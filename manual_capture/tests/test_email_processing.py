@@ -14,6 +14,7 @@ from manual_capture.email_processing import (
     local_email_parse,
     redact,
     remove_unanchored_relative_times,
+    stabilize_exam_workflow_proposals,
 )
 from manual_capture.imap_agent import local_api_url
 
@@ -116,6 +117,55 @@ def test_understand_email_applies_relative_time_guard(monkeypatch):
     result = client.understand_email({"subject": "在线测评", "sender_domain": "campus.example", "evidence": [{"id": 1, "text": "收到本邮件后48小时内完成测评"}]})
     assert result.proposals[0].action_deadline == ""
     assert result.proposals[0].evidence_ids == [1]
+
+
+@pytest.mark.parametrize("text, deadline", [
+    ("产品运营在线测评入口已开放，请在2026-08-23 23:59前提交。", "2026-08-23T23:59"),
+    ("请于收到本邮件后48小时内完成研发岗在线测评。", ""),
+    ("请在明晚24:00前完成在线笔试。", ""),
+])
+def test_exam_action_always_keeps_a_separate_exam_stage(text, deadline):
+    understanding = EmailUnderstanding(proposals=[EmailProposal(
+        kind="行动截止", category="笔试", summary="完成测评", confidence=85,
+        action_deadline=deadline, evidence_ids=[1],
+    )])
+    result = stabilize_exam_workflow_proposals(understanding, [text])
+    assert [(item.kind, item.category) for item in result.proposals] == [("阶段推进", "笔试"), ("行动截止", "笔试")]
+    assert result.proposals[0].evidence_ids == [1]
+
+
+def test_conditional_future_interview_is_only_a_manual_reminder():
+    understanding = EmailUnderstanding(proposals=[EmailProposal(
+        kind="阶段推进", category="面试", summary="后续面试", confidence=80,
+        scheduled_date="2026-08-28T10:00", evidence_ids=[1],
+    )])
+    result = stabilize_exam_workflow_proposals(understanding, ["通过后拟于2026-08-28 10:00安排面试。"])
+    assert result.proposals[0].kind == "提醒"
+    assert result.proposals[0].scheduled_date == ""
+
+
+@pytest.mark.parametrize("case_id, text, proposals, expected", [
+    ("screen_pass", "恭喜通过初筛，请于2026-08-22 18:00前完成在线测评。", [
+        EmailProposal(kind="阶段推进", category="笔试", summary="通过初筛", confidence=90, evidence_ids=[1]),
+        EmailProposal(kind="行动截止", category="笔试", summary="测评截止", action_deadline="2026-08-22T18:00", confidence=90, evidence_ids=[1]),
+    ], [("阶段推进", "笔试"), ("行动截止", "笔试")]),
+    ("assessment", "产品运营在线测评入口已开放，请在2026-08-23 23:59前提交。", [
+        EmailProposal(kind="行动截止", category="笔试", summary="测评截止", action_deadline="2026-08-23T23:59", confidence=90, evidence_ids=[1]),
+    ], [("阶段推进", "笔试"), ("行动截止", "笔试")]),
+    ("multiple_dates", "测评请在2026-08-25 20:00前完成；通过后拟于2026-08-28 10:00安排面试。", [
+        EmailProposal(kind="行动截止", category="笔试", summary="测评截止", action_deadline="2026-08-25T20:00", confidence=90, evidence_ids=[1]),
+        EmailProposal(kind="阶段推进", category="面试", summary="后续面试", scheduled_date="2026-08-28T10:00", confidence=80, evidence_ids=[2]),
+    ], [("阶段推进", "笔试"), ("行动截止", "笔试"), ("提醒", "面试")]),
+    ("mixed", "请于2026-08-26 18:00前完成测评。通过后，面试时间为2026-08-29 09:00。", [
+        EmailProposal(kind="行动截止", category="笔试", summary="测评截止", action_deadline="2026-08-26T18:00", confidence=90, evidence_ids=[1]),
+        EmailProposal(kind="阶段推进", category="面试", summary="后续面试", scheduled_date="2026-08-29T09:00", confidence=80, evidence_ids=[2]),
+    ], [("阶段推进", "笔试"), ("行动截止", "笔试"), ("提醒", "面试")]),
+])
+def test_p0_realistic_regression_decomposes_exam_without_confirming_conditional_interview(case_id, text, proposals, expected):
+    evidence = text.split("；") if "；" in text else text.split("。")
+    evidence = [item for item in evidence if item]
+    result = stabilize_exam_workflow_proposals(EmailUnderstanding(proposals=proposals), evidence)
+    assert [(item.kind, item.category) for item in result.proposals] == expected, case_id
 
 
 def test_candidate_gate_recalls_applicant_workflow_and_rejects_marketing_controls():

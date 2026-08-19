@@ -1,0 +1,22 @@
+{"dataset":"reconstructed realistic benchmark","provenance":"Original realistic 20-case corpus was not present in the repository or readable historical pytest directories on 2026-08-20.","cases":[
+{"id":"web_application","subject":"中国银行网申成功","body":"您申请的金融科技培训生岗位网申成功，申请已提交。","candidate":true,"required":[["阶段推进","其他"]]},
+{"id":"screen_pass","subject":"中国电信简历筛选结果","body":"恭喜您通过云网运营岗简历筛选，请于2026年8月22日18:00前完成在线测评。","candidate":true,"required":[["阶段推进","笔试"],["行动截止","笔试"]]},
+{"id":"assessment","subject":"字节跳动测评邀请","body":"产品运营在线测评入口已开放，请在2026-08-23 23:59前提交。","candidate":true,"required":[["阶段推进","笔试"],["行动截止","笔试"]]},
+{"id":"written_exam","subject":"招商银行笔试安排","body":"请参加数据分析岗在线笔试，考试安排在2026-08-24 19:00开始。","candidate":true,"required":[["阶段推进","笔试"]]},
+{"id":"first_interview","subject":"外企咨询一面面试邀请","body":"我们邀请您参加商业分析岗一面，时间为2026-08-25 10:00。","candidate":true,"required":[["阶段推进","面试"]]},
+{"id":"second_final","subject":"中车集团终面通知","body":"您已进入终面，面试安排在2026-08-26 14:00。","candidate":true,"required":[["阶段推进","面试"]]},
+{"id":"hr_interview","subject":"美的集团HR面安排","body":"请参加HR面，时间为2026-08-27 15:30。","candidate":true,"required":[["阶段推进","面试"]]},
+{"id":"offer","subject":"联合利华Offer通知","body":"恭喜您获得供应链管培生Offer，请于2026-08-28 12:00前回复。","candidate":true,"required":[["阶段推进","Offer"],["行动截止","Offer"]]},
+{"id":"rejection","subject":"关于申请结果的通知","body":"感谢申请宁德时代电池研发岗，很遗憾本次未能通过筛选。","candidate":true,"required":[["阶段推进","拒信"]]},
+{"id":"materials","subject":"国开行请补充材料","body":"请于2026-08-29 17:00前补充成绩单和在读证明。","candidate":true,"required":[["补充材料","其他"]]},
+{"id":"reschedule","subject":"中国移动面试时间调整","body":"原定2026-08-21 10:00的面试调整至2026-08-30 15:00。","candidate":true,"required":[["改期取消","面试"]]},
+{"id":"cancellation","subject":"面试取消通知","body":"原定算法工程师面试已取消，请勿按原计划参加。","candidate":true,"required":[["改期取消","面试"]]},
+{"id":"thread_update","subject":"京东面试安排更新","body":"最新通知：面试改为2026-09-01 11:00。历史邮件：2026-08-20 09:00。","candidate":true,"required":[["改期取消","面试"]]},
+{"id":"multiple_dates","subject":"浦发银行在线测评","body":"测评请在2026-08-25 20:00前完成；通过后拟于2026-08-28 10:00安排面试。","candidate":true,"required":[["阶段推进","笔试"],["行动截止","笔试"]],"conditional_interview":true},
+{"id":"relative_48","subject":"OPPO测评提醒","body":"请于收到本邮件后48小时内完成研发岗在线测评。","candidate":true,"required":[["阶段推进","笔试"],["行动截止","笔试"]],"relative":true},
+{"id":"relative_tomorrow","subject":"网易互娱笔试通知","body":"请在明晚24:00前完成在线笔试。","candidate":true,"required":[["阶段推进","笔试"],["行动截止","笔试"]],"relative":true},
+{"id":"time_pending","subject":"中广核面试通知","body":"您已进入下一轮面试，具体面试时间将另行通知。","candidate":true,"required":[["阶段推进","面试"]]},
+{"id":"mixed","subject":"海尔校招通知","body":"请于2026-08-26 18:00前完成测评。通过后，面试时间为2026-08-29 09:00。","candidate":true,"required":[["阶段推进","笔试"],["行动截止","笔试"]],"conditional_interview":true},
+{"id":"long_notice","subject":"中国船舶集团综合测评通知","body":"中国船舶集团2027年度校园招聘。经审核，请参加系统工程方向综合测评。测评时间为2026年8月31日09:00，请于2026年8月30日18:00前回复确认。","candidate":true,"required":[["阶段推进","笔试"],["行动截止","笔试"]]},
+{"id":"marketing_noise","subject":"校招宣讲会与面试技巧分享","body":"欢迎订阅本周热招职位、品牌新闻和面试技巧；以下为历史引用的招聘安排，并非个人申请。","candidate":false,"required":[]}
+]}

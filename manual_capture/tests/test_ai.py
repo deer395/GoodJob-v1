@@ -57,6 +57,31 @@ def test_email_understanding_returns_cited_multiple_proposals(monkeypatch):
     assert len(parsed.proposals) == 2 and parsed.proposals[1].action_deadline == "2026-08-18T20:00"
 
 
+def test_email_understanding_backfills_exam_stage_without_changing_relative_deadline(monkeypatch):
+    client = OpenAIClient()
+    monkeypatch.setattr(client, "_call", lambda *_: {"company": "", "title": "", "city": "", "proposals": [
+        {"kind": "行动截止", "category": "笔试", "summary": "完成测评", "suggested_action": "完成", "location": "", "scheduled_date": "", "action_deadline": "2026-08-24T18:00", "confidence": 85, "evidence_ids": [1]},
+    ]})
+    parsed = client.understand_email({"subject": "测评", "sender_domain": "example.com", "evidence": [{"id": 1, "text": "收到本邮件后48小时内完成在线测评"}]})
+    assert [(item.kind, item.category) for item in parsed.proposals] == [("阶段推进", "笔试"), ("行动截止", "笔试")]
+    assert all(not item.action_deadline for item in parsed.proposals)
+
+
+def test_relative_exam_stage_stays_confirmable_while_action_becomes_manual_reminder(tmp_path):
+    app = create_app(tmp_path / "relative-exam-stage.db")
+    store = app.state.store
+    store.insert_email_event({"dedup_key": "relative-exam-stage", "subject": "测评", "snippet": "收到本邮件后48小时内完成测评", "received_at": "2026-08-20T10:00:00"})
+    understanding = EmailUnderstanding(proposals=[
+        EmailProposal(kind="阶段推进", category="笔试", summary="进入测评/笔试阶段", confidence=85, evidence_ids=[1]),
+        EmailProposal(kind="行动截止", category="笔试", summary="48小时内完成测评", confidence=85, evidence_ids=[1]),
+    ])
+    store.update_email_understanding(1, understanding, ["收到本邮件后48小时内完成测评"])
+    proposals = store.email_proposals(1)
+    assert [(item["kind"], item["category"], item["action_deadline_at"]) for item in proposals] == [
+        ("阶段推进", "笔试", None), ("提醒", "笔试", None),
+    ]
+
+
 def test_email_proposal_normalizes_space_separated_datetime_to_canonical_iso():
     proposal = EmailProposal(kind="阶段推进", category="面试", summary="一面", confidence=90, evidence_ids=[1], scheduled_date="2026-08-18 10:30")
     assert proposal.scheduled_date == "2026-08-18T10:30"

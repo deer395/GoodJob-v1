@@ -35,6 +35,12 @@ EXPLICIT_CALENDAR_DATE_RE = re.compile(
     r"(?:20\d{2}\s*(?:年|[-/])\s*\d{1,2}\s*(?:月|[-/])\s*\d{1,2}\s*日?|\d{1,2}\s*月\s*\d{1,2}\s*日?)"
 )
 
+# This is deliberately narrower than general recruitment classification.  It
+# is used only to keep a clearly stated assessment/exam workflow transition
+# separate from its deadline/reminder proposal.
+EXAM_ACTION_RE = re.compile(r"(?:测评|笔试|在线考试)")
+CONDITIONAL_FUTURE_RE = re.compile(r"(?:通过后|如(?:果)?(?:测评|笔试)?通过|若(?:测评|笔试)?通过)")
+
 def candidate_subject(subject: str) -> bool:
     text = subject.lower()
     return any(word.lower() in text for word in CANDIDATE_WORDS) and not any(word in text for word in EXCLUDED_WORDS)
@@ -231,3 +237,37 @@ def remove_unanchored_relative_times(understanding: EmailUnderstanding, evidence
             proposal = proposal.model_copy(update={"scheduled_date": "", "action_deadline": ""})
         safe_proposals.append(proposal)
     return understanding.model_copy(update={"proposals": safe_proposals})
+
+
+def stabilize_exam_workflow_proposals(understanding: EmailUnderstanding, evidence: list[str]) -> EmailUnderstanding:
+    """Preserve explicit assessment entry independently from its action time.
+
+    This is a narrow safety net for a known LLM decomposition failure.  It
+    neither infers a deadline nor creates events for interviews, Offers, or
+    rejections.  Every synthesized proposal cites the same explicit exam text
+    and remains pending for user confirmation.
+    """
+    proposals: list[EmailProposal] = []
+    for proposal in understanding.proposals:
+        cited = "\n".join(
+            evidence[index - 1] for index in proposal.evidence_ids
+            if isinstance(index, int) and 1 <= index <= len(evidence)
+        )
+        if proposal.kind == "阶段推进" and proposal.category == "面试" and CONDITIONAL_FUTURE_RE.search(cited):
+            proposal = proposal.model_copy(update={"kind": "提醒", "scheduled_date": "", "action_deadline": ""})
+        proposals.append(proposal)
+
+    has_exam_stage = any(item.kind == "阶段推进" and item.category == "笔试" for item in proposals)
+    exam_action = next((item for item in proposals if item.category == "笔试" and item.kind in {"行动截止", "提醒"}), None)
+    if not has_exam_stage and exam_action and len(proposals) < 3:
+        cited = "\n".join(
+            evidence[index - 1] for index in exam_action.evidence_ids
+            if isinstance(index, int) and 1 <= index <= len(evidence)
+        )
+        if EXAM_ACTION_RE.search(cited):
+            proposals.insert(0, EmailProposal(
+                kind="阶段推进", category="笔试", summary="进入测评/笔试阶段",
+                suggested_action="准备并完成测评/笔试", confidence=exam_action.confidence,
+                evidence_ids=exam_action.evidence_ids,
+            ))
+    return understanding.model_copy(update={"proposals": proposals})

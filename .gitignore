@@ -21,3 +21,15 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local Codex/workbench state and disposable test artifacts
+.workbuddy/
+pytest_*/
+pytest_*.db
+*.pytest.log
+manual_capture/server-*.out.log
+manual_capture/server-*.err.log
+
+# Local backup and restore-verification artifacts (never source data)
+manual_capture/backups/
+manual_capture/*.restore-pending*.json
