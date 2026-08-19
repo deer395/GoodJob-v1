@@ -1,0 +1,25 @@
+{
+  "dataset": "phase3b-candidate-gate-v1",
+  "purpose": "Synthetic, de-identified recall and marketing-control cases for the local recruitment-email gate.",
+  "cases": [
+    {"id":"second_interview","subject":"腾讯 2027 校招二面安排","body":"恭喜进入二面，请留意后续安排。","candidate":true},
+    {"id":"second_round_interview","subject":"二轮面试通知","body":"您申请的后端开发工程师岗位进入二轮面试。","candidate":true},
+    {"id":"retest","subject":"关于复试安排","body":"您已通过初试，现邀请参加复试。","candidate":true},
+    {"id":"final_interview","subject":"终面安排更新","body":"恭喜你进入终面，请保持电话畅通。","candidate":true},
+    {"id":"hr_interview","subject":"西门子 HR 面安排","body":"您申请的管理培训生岗位进入 HR 面。","candidate":true},
+    {"id":"next_round","subject":"申请进度更新","body":"您的申请已进入下一轮，请耐心等待。","candidate":true},
+    {"id":"rejection_next_round","subject":"关于申请结果","body":"很遗憾，您暂不进入下一轮。","candidate":true},
+    {"id":"rejection_screening","subject":"简历筛选结果","body":"经评估，您未能通过筛选，感谢关注。","candidate":true},
+    {"id":"rejection_closed","subject":"招聘流程进展","body":"该岗位招聘流程结束，您的申请将不再推进。","candidate":true},
+    {"id":"application_success","subject":"网申成功通知","body":"我们已收到您的申请，简历已进入筛选。","candidate":true},
+    {"id":"resume_submitted","subject":"简历提交成功","body":"您的申请已提交，请留意后续通知。","candidate":true},
+    {"id":"received_application","subject":"申请确认","body":"已收到您的申请，感谢投递。","candidate":true},
+    {"id":"job_recommendation","subject":"招聘网站：为你推荐产品经理职位","body":"根据你的订阅推送 10 个热招岗位，立即查看职位详情。","candidate":false},
+    {"id":"brand_campaign","subject":"2027 校招品牌宣传｜探索无限可能","body":"欢迎了解公司文化与青年人才计划。","candidate":false},
+    {"id":"campus_talk","subject":"校园宣讲会通知","body":"报名参加校招宣讲会，现场领取纪念品。","candidate":false},
+    {"id":"headhunter_recommendation","subject":"猎头推荐：适合你的新机会","body":"这里有一批热门岗位推荐，不涉及你已提交的任何申请。","candidate":false},
+    {"id":"linkedin_marketing","subject":"LinkedIn 职位推荐周报","body":"你的职业网络有新的热门职位推荐。","candidate":false},
+    {"id":"company_news","subject":"公司新闻：年度社会责任报告发布","body":"阅读我们的最新企业新闻与行业资讯。","candidate":false},
+    {"id":"interview_tips","subject":"面试技巧分享：如何准备二面","body":"阅读面试技巧和二面常见问题，提升求职能力。","candidate":false}
+  ]
+}

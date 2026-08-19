@@ -1,4 +1,6 @@
 import pytest
+import json
+from pathlib import Path
 
 from manual_capture.ai import OpenAIClient
 from manual_capture.email_processing import (
@@ -14,6 +16,8 @@ from manual_capture.email_processing import (
     remove_unanchored_relative_times,
 )
 from manual_capture.imap_agent import local_api_url
+
+GATE_CORPUS = Path(__file__).resolve().parents[2] / "evaluation" / "phase3b_email_understanding" / "candidate_gate_cases.json"
 
 def test_local_filter_redaction_and_dedup():
     assert candidate_subject('【笔试通知】产品经理')
@@ -112,3 +116,14 @@ def test_understand_email_applies_relative_time_guard(monkeypatch):
     result = client.understand_email({"subject": "在线测评", "sender_domain": "campus.example", "evidence": [{"id": 1, "text": "收到本邮件后48小时内完成测评"}]})
     assert result.proposals[0].action_deadline == ""
     assert result.proposals[0].evidence_ids == [1]
+
+
+def test_candidate_gate_recalls_applicant_workflow_and_rejects_marketing_controls():
+    cases = json.loads(GATE_CORPUS.read_text(encoding="utf-8"))["cases"]
+    positives = [case for case in cases if case["candidate"]]
+    negatives = [case for case in cases if not case["candidate"]]
+    missed = [case["id"] for case in positives if not candidate_email(case["subject"], case["body"])]
+    false_positives = [case["id"] for case in negatives if candidate_email(case["subject"], case["body"])]
+    assert len(positives) >= 12 and len(negatives) >= 7
+    assert missed == []
+    assert false_positives == []

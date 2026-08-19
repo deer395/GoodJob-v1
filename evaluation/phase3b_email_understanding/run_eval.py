@@ -14,6 +14,7 @@ from manual_capture.ai import AIUnavailable, OpenAIClient
 from manual_capture.email_processing import candidate_email, email_evidence
 
 ROOT = Path(__file__).resolve().parent
+GATE_CORPUS = ROOT / "candidate_gate_cases.json"
 
 
 def required_pairs(case: dict) -> set[tuple[str, str]]:
@@ -28,6 +29,20 @@ def main() -> int:
     cases = corpus["cases"]
     local = [{"id": c["id"], "expected_candidate": c["candidate"], "actual_candidate": candidate_email(c["subject"], c["body"]), "evidence_count": len(email_evidence(c["body"]))} for c in cases]
     report: dict = {"dataset": corpus["dataset"], "total_cases": len(cases), "local_gate_passed": sum(item["expected_candidate"] == item["actual_candidate"] for item in local), "local_gate": local}
+    gate_cases = json.loads(GATE_CORPUS.read_text(encoding="utf-8"))["cases"]
+    positives = [case for case in gate_cases if case["candidate"]]
+    negatives = [case for case in gate_cases if not case["candidate"]]
+    missed = [case["id"] for case in positives if not candidate_email(case["subject"], case["body"])]
+    false_positives = [case["id"] for case in negatives if candidate_email(case["subject"], case["body"])]
+    report["candidate_gate"] = {
+        "dataset": "phase3b-candidate-gate-v1",
+        "positive_total": len(positives),
+        "positive_recall": (len(positives) - len(missed)) / len(positives) if positives else 1,
+        "missed_ids": missed,
+        "negative_total": len(negatives),
+        "negative_false_positive_rate": len(false_positives) / len(negatives) if negatives else 0,
+        "false_positive_ids": false_positives,
+    }
     if not args.live:
         report["note"] = "No provider call was made. Run with --live only after confirming the configured AI provider and its cost."
         print(json.dumps(report, ensure_ascii=False, indent=2))

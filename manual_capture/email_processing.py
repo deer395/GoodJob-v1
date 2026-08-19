@@ -5,9 +5,23 @@ from urllib.parse import urlsplit, urlunsplit
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 PARSER_VERSION = "email-v3"
-CANDIDATE_WORDS = ("笔试", "面试", "测评", "offer", "拒信", "感谢投递", "面试邀请", "笔试通知", "在线测评", "录用通知", "遗憾", "下一步", "通知")
+CANDIDATE_WORDS = (
+    "笔试", "面试", "测评", "offer", "拒信", "感谢投递", "面试邀请", "笔试通知", "在线测评", "录用通知", "遗憾", "下一步", "通知",
+    "二面", "二轮面试", "复试", "终面", "hr面", "hr 面", "下一轮", "进入下一环节",
+    "暂不进入下一轮", "未能通过筛选", "不再推进", "招聘流程结束", "无法继续推进",
+    "网申成功", "简历提交成功", "已收到您的申请", "申请已提交", "简历已进入筛选",
+)
 EXCLUDED_WORDS = ("宣讲", "竞赛", "内推", "推荐有礼")
 BODY_CANDIDATE_WORDS = CANDIDATE_WORDS + ("简历筛选", "材料", "改期", "取消", "回复", "申请进度")
+PROMOTIONAL_WORDS = ("职位推荐", "岗位推荐", "热招", "订阅", "品牌宣传", "品牌故事", "公司新闻", "行业资讯", "面试技巧", "求职技巧", "校招攻略", "公众号", "猎头推荐", "领英", "linkedin")
+# These indicate that a message is about the recipient's own application.  A
+# broad recruiting word is sufficient for recall in ordinary mail, but a
+# marketing-looking subject must also contain one of these signals before it
+# enters the paid/manual understanding flow.
+PERSONAL_APPLICATION_SIGNALS = (
+    "您的申请", "你已", "您已", "恭喜", "网申成功", "简历提交成功", "已收到您的申请", "申请已提交", "简历已进入筛选",
+    "暂不进入下一轮", "未能通过筛选", "不再推进", "招聘流程结束", "无法继续推进", "进入下一环节",
+)
 
 # A calendar date can stand on its own, while phrases such as “明晚” and
 # “收到邮件后 48 小时” need a trustworthy message-time anchor.  The current
@@ -27,11 +41,18 @@ def candidate_subject(subject: str) -> bool:
 
 
 def candidate_email(subject: str, body: str) -> bool:
-    """Local recall gate.  It never persists the body and excludes obvious campaigns."""
+    """Local recall gate for recruitment workflow mail, not general recruiting content."""
     joined = f"{subject}\n{body}".lower()
-    return any(word.lower() in joined for word in BODY_CANDIDATE_WORDS) and not (
-        any(word in subject.lower() for word in EXCLUDED_WORDS) and not any(word.lower() in body.lower() for word in ("面试", "笔试", "测评", "offer"))
-    )
+    subject_lower = subject.lower()
+    body_lower = body.lower()
+    if not any(word.lower() in joined for word in BODY_CANDIDATE_WORDS):
+        return False
+    personal = any(word.lower() in joined for word in PERSONAL_APPLICATION_SIGNALS)
+    if any(word in subject_lower for word in EXCLUDED_WORDS + PROMOTIONAL_WORDS) and not personal:
+        return False
+    # Keep ordinary applicant-specific results and round notifications easy to
+    # recall.  Event classification remains the responsibility of the parser.
+    return True
 
 def _redact(value: str) -> str:
     value = re.sub(r"[\w.+-]+@[\w.-]+", "[邮箱]", value)

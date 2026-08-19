@@ -8,7 +8,7 @@
 D:\ANACONDA\python.exe evaluation\phase3b_email_understanding\run_eval.py
 ```
 
-它验证本地候选筛选与证据句提取。若要评估当前配置的真实模型，才主动运行：
+它验证本地候选筛选与证据句提取，并输出独立门禁语料的正样本 recall、负样本误召回率、漏检和误召回案例。若要评估当前配置的真实模型，才主动运行：
 
 ```powershell
 D:\ANACONDA\python.exe evaluation\phase3b_email_understanding\run_eval.py --live
