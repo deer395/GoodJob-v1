@@ -4,10 +4,22 @@ from datetime import date, datetime
 from urllib.parse import urlsplit, urlunsplit
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-PARSER_VERSION = "email-v2"
+PARSER_VERSION = "email-v3"
 CANDIDATE_WORDS = ("笔试", "面试", "测评", "offer", "拒信", "感谢投递", "面试邀请", "笔试通知", "在线测评", "录用通知", "遗憾", "下一步", "通知")
 EXCLUDED_WORDS = ("宣讲", "竞赛", "内推", "推荐有礼")
 BODY_CANDIDATE_WORDS = CANDIDATE_WORDS + ("简历筛选", "材料", "改期", "取消", "回复", "申请进度")
+
+# A calendar date can stand on its own, while phrases such as “明晚” and
+# “收到邮件后 48 小时” need a trustworthy message-time anchor.  The current
+# email-understanding payload deliberately does not contain such an anchor, so
+# these expressions must remain manual rather than becoming guessed ISO times.
+RELATIVE_TIME_RE = re.compile(
+    r"(?:收到(?:本)?(?:邮件|通知)?后\s*(?:\d+|[一二三四五六七八九十]+)\s*(?:个)?(?:小时|天|日)(?:内|后)?|"
+    r"(?:明天|明晚|后天|今晚|今天|本周[一二三四五六日天]|下周[一二三四五六日天]|(?:\d+|[一二三四五六七八九十]+)\s*天后))"
+)
+EXPLICIT_CALENDAR_DATE_RE = re.compile(
+    r"(?:20\d{2}\s*(?:年|[-/])\s*\d{1,2}\s*(?:月|[-/])\s*\d{1,2}\s*日?|\d{1,2}\s*月\s*\d{1,2}\s*日?)"
+)
 
 def candidate_subject(subject: str) -> bool:
     text = subject.lower()
@@ -177,3 +189,24 @@ class EmailUnderstanding(BaseModel):
     title: str = Field(default="", max_length=160)
     city: str = Field(default="", max_length=120)
     proposals: list[EmailProposal] = Field(default_factory=list, max_length=3)
+
+
+def remove_unanchored_relative_times(understanding: EmailUnderstanding, evidence: list[str]) -> EmailUnderstanding:
+    """Clear LLM-inferred times when cited evidence only gives a relative phrase.
+
+    This function intentionally does not calculate against ``received_at``:
+    email understanding currently receives only redacted evidence and has no
+    explicit timezone contract.  The proposal, summary and evidence remain so
+    the user can still review the relative instruction manually.
+    """
+    safe_proposals: list[EmailProposal] = []
+    for proposal in understanding.proposals:
+        cited = "\n".join(
+            evidence[index - 1]
+            for index in proposal.evidence_ids
+            if isinstance(index, int) and 1 <= index <= len(evidence)
+        )
+        if RELATIVE_TIME_RE.search(cited) and not EXPLICIT_CALENDAR_DATE_RE.search(cited):
+            proposal = proposal.model_copy(update={"scheduled_date": "", "action_deadline": ""})
+        safe_proposals.append(proposal)
+    return understanding.model_copy(update={"proposals": safe_proposals})

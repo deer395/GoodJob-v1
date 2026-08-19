@@ -243,6 +243,27 @@ def test_pending_email_can_be_reparsed_to_fill_key_time(tmp_path):
     assert app.state.store.email_event(1)["proposed_action_deadline_at"] == "2026-08-12T20:00"
 
 
+def test_unanchored_relative_deadline_stays_manual_and_cannot_confirm(tmp_path):
+    from manual_capture.email_processing import EmailProposal, EmailUnderstanding
+
+    app = create_app(tmp_path / "relative-deadline.db")
+    store = app.state.store
+    store.insert_email_event({"dedup_key": "test:relative-deadline", "subject": "在线测评", "snippet": "收到本邮件后48小时内完成测评", "received_at": "2026-08-20T10:00:00"})
+    understanding = EmailUnderstanding(proposals=[EmailProposal(
+        kind="行动截止", category="笔试", summary="收到邮件后48小时内完成", confidence=80, evidence_ids=[1],
+    )])
+    store.update_email_understanding(1, understanding, ["收到本邮件后48小时内完成测评"])
+    proposal = store.email_proposals(1)[0]
+    assert proposal["kind"] == "提醒"
+    assert proposal["action_deadline_at"] is None
+    try:
+        store.resolve_email_proposal(proposal["id"], 1)
+    except ValueError as error:
+        assert "人工核对" in str(error)
+    else:
+        raise AssertionError("relative deadline must not become confirmable")
+
+
 def test_primary_pages_expose_ai_settings_navigation(tmp_path):
     client = TestClient(create_app(tmp_path / "nav.db"))
     for path in ("/", "/jobs", "/applications", "/progress", "/profile", "/import", "/progress?view=calendar"):

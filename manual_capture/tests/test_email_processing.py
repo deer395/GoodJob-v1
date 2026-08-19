@@ -1,4 +1,18 @@
-from manual_capture.email_processing import candidate_email, candidate_subject, dedup_key, email_evidence, email_excerpt, local_email_parse, redact
+import pytest
+
+from manual_capture.ai import OpenAIClient
+from manual_capture.email_processing import (
+    EmailProposal,
+    EmailUnderstanding,
+    candidate_email,
+    candidate_subject,
+    dedup_key,
+    email_evidence,
+    email_excerpt,
+    local_email_parse,
+    redact,
+    remove_unanchored_relative_times,
+)
 from manual_capture.imap_agent import local_api_url
 
 def test_local_filter_redaction_and_dedup():
@@ -46,3 +60,55 @@ def test_email_evidence_keeps_numbered_notice_heading_with_its_value():
     assert any('应聘岗位：系统工程/数据分析方向' in item for item in evidence)
     assert any('身份证原件；学生证；个人简历3份；成绩单' in item for item in evidence)
     assert any('中国船舶集团' in item for item in evidence)
+
+
+@pytest.mark.parametrize("text", [
+    "请于收到本邮件后 48 小时内完成在线测评。",
+    "请于收到通知后三日内完成材料提交。",
+    "请在明晚 24:00 前完成笔试。",
+    "请于本周五前回复是否参加。",
+])
+def test_relative_time_without_anchor_never_keeps_llm_iso_time(text):
+    understanding = EmailUnderstanding(proposals=[EmailProposal(
+        kind="行动截止", category="笔试", summary="请按要求完成", confidence=80,
+        action_deadline="2026-08-24T18:00", evidence_ids=[1],
+    )])
+    filtered = remove_unanchored_relative_times(understanding, [text])
+    assert filtered.proposals[0].action_deadline == ""
+    assert filtered.proposals[0].scheduled_date == ""
+    assert filtered.proposals[0].evidence_ids == [1]
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("请于 8 月 24 日 18:00 前完成测评。", "2026-08-24T18:00"),
+    ("请于 2026-08-24 18:00 前完成测评。", "2026-08-24T18:00"),
+])
+def test_explicit_calendar_deadline_is_preserved(text, expected):
+    understanding = EmailUnderstanding(proposals=[EmailProposal(
+        kind="行动截止", category="笔试", summary="测评截止", confidence=80,
+        action_deadline=expected, evidence_ids=[1],
+    )])
+    filtered = remove_unanchored_relative_times(understanding, [text])
+    assert filtered.proposals[0].action_deadline == expected
+
+
+def test_relative_phrase_does_not_remove_explicit_start_and_deadline():
+    evidence = ["笔试于 2026-08-23 09:00 开始；请于 2026-08-24 18:00 前完成，收到邮件后请尽快安排。"]
+    understanding = EmailUnderstanding(proposals=[EmailProposal(
+        kind="阶段推进", category="笔试", summary="笔试安排", confidence=80,
+        scheduled_date="2026-08-23T09:00", action_deadline="2026-08-24T18:00", evidence_ids=[1],
+    )])
+    filtered = remove_unanchored_relative_times(understanding, evidence)
+    assert filtered.proposals[0].scheduled_date == "2026-08-23T09:00"
+    assert filtered.proposals[0].action_deadline == "2026-08-24T18:00"
+
+
+def test_understand_email_applies_relative_time_guard(monkeypatch):
+    client = OpenAIClient()
+    monkeypatch.setattr(client, "_call", lambda *_: {"company": "星河科技", "title": "产品经理", "city": "", "proposals": [{
+        "kind": "行动截止", "category": "笔试", "summary": "完成测评", "suggested_action": "完成测评",
+        "location": "", "scheduled_date": "", "action_deadline": "2026-08-24T18:00", "confidence": 85, "evidence_ids": [1],
+    }]})
+    result = client.understand_email({"subject": "在线测评", "sender_domain": "campus.example", "evidence": [{"id": 1, "text": "收到本邮件后48小时内完成测评"}]})
+    assert result.proposals[0].action_deadline == ""
+    assert result.proposals[0].evidence_ids == [1]
