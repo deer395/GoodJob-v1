@@ -187,18 +187,6 @@ GoodJob-v1/
 └── evaluation/               # 评估与 benchmark
 ```
 
----
-
-## 测试
-
-```powershell
-$env:CAMPUSAI_DB_PATH = "$PWD\pytest_local\campusai.db"
-python -m pytest manual_capture/tests -q --basetemp "$PWD\pytest_local\tmp"
-```
-
-V1 冻结验收：**112 passed**；重建 20 例真实邮件 benchmark，结果为 **19/19 candidate recall、27/27 required-event coverage、0 Critical Error、0 incorrect Deadline、0 silent auto-confirm**。
-
----
 
 ## 不包含的能力（边界声明）
 
